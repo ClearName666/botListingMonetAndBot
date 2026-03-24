@@ -1,0 +1,5 @@
+aiogram
+requests
+ccxt
+certifi
+urllib3
