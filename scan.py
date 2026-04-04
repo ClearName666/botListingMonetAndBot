@@ -46,7 +46,7 @@ def scan_arbitrage_opportunities_test(
     hyperliquid_fut,
     htx_spot, htx_fut,
     xt_spot, # xt_fut,
-    okx_spot, okx_fut,
+    # okx_spot, okx_fut,
     coinex_spot, coinex_fut,
     min_diff_percent=1.0,
     max_diff_percent=100.0,
@@ -57,7 +57,7 @@ def scan_arbitrage_opportunities_test(
                   | set(bingx_spot.keys()) | set(bingx_futures.keys()) | set(bybit_spot.keys()) | set(bybit_futures.keys()) \
                   | set(bitget_spot.keys()) | set(bitget_futures.keys()) | set(binance_spot.keys()) | set(binance_fut.keys()) \
                   | set(hyperliquid_fut.keys()) \
-                  | set(htx_spot.keys()) | set(htx_fut.keys()) | set(xt_spot.keys()) | set(okx_spot.keys()) | set(okx_fut.keys()) | set(coinex_spot.keys()) | set(coinex_fut.keys()) # | set(xt_fut.keys())
+                  | set(htx_spot.keys()) | set(htx_fut.keys()) | set(xt_spot.keys())  | set(coinex_spot.keys()) | set(coinex_fut.keys()) # | set(xt_fut.keys()) | set(okx_spot.keys()) | set(okx_fut.keys())
 
 
     exchanges = {
@@ -69,7 +69,7 @@ def scan_arbitrage_opportunities_test(
         'Binance': {'spot': binance_spot, 'futures': binance_fut},
         'Hyperliquid': {'futures': hyperliquid_fut},
         "XT": {'spot': xt_spot}, # , 'futures': xt_fut
-        'OKX': {'spot': okx_spot, 'futures': okx_fut},
+        # 'OKX': {'spot': okx_spot, 'futures': okx_fut},
         'HTX': {'spot': htx_spot, 'futures': htx_fut},
         'Coinex': {'spot': coinex_spot, 'futures': coinex_fut},
     }
