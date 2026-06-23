@@ -32,6 +32,13 @@ LISTING_ID = "-1003224074615"
 LISTING_MONET_ID = "-1003269912551"
 
 
+CHANNEL_ID_FUTURES_STOT = "-1004415544476"
+
+
+LISTING_ID_SENA = "-1003657279769"
+CHANNEL_ID_MAX_SENA = "-1004437250336"
+CHANNEL_ID_SENA = "-1003929442314"
+
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -109,40 +116,69 @@ async def send_telegram_opportunity(opp):
         else:
             print(f"⚠️ Кнопка не создана для {opp['symbol']}: слишком длинные данные ({len(callback_string.encode('utf-8'))} байт)")            
 
-        # Отправка в основной канал
-        await bot.send_message(CHANNEL_ID, msg, parse_mode="HTML", disable_web_page_preview=True,
-                               reply_markup=reply_markup)
-        await asyncio.sleep(0.5) # Небольшая задержка перед следующими отправками
 
-        # Отправка в канал MAX
-        if opp['profit_percent'] >= dataApp.MIN_PROFIT_MAX:
-            await bot.send_message(CHANNEL_ID_MAX, msg, parse_mode="HTML", disable_web_page_preview=True,
-                                   reply_markup=reply_markup)
-            await asyncio.sleep(0.5)
+        
 
-        # Отправка в канал ЛИСТИНГОВ (по файлу)
-        parsed_listings = parse_listings_file_to_array()
-        if is_listing_match(opp, parsed_listings):
-            await bot.send_message(
-                LISTING_ID,
-                msg,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=reply_markup
-            )
-            await asyncio.sleep(0.5)
+        if opp['buy_type'].lower() == "futures" and opp['sell_type'].lower() == "spot":
+            await bot.send_message(CHANNEL_ID_FUTURES_STOT, msg, parse_mode="HTML")
+            await asyncio.sleep(0.5) # Небольшая задержка перед следующими отправками
+        else:
+            # Отправка в основной канал
+            await bot.send_message(CHANNEL_ID, msg, parse_mode="HTML", disable_web_page_preview=True,
+                                reply_markup=reply_markup)
+            await asyncio.sleep(0.5) # Небольшая задержка перед следующими отправками
 
-        # Отправка в канал ЛИСТИНГОВ (по символу)
-        all_listed_symbols = get_all_listed_symbols()
-        if opp['symbol'] in all_listed_symbols:
-            await bot.send_message(
-                LISTING_MONET_ID,
-                msg,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=reply_markup
-            )
-            await asyncio.sleep(0.5)
+            await bot.send_message(CHANNEL_ID_SENA, msg, parse_mode="HTML")
+            await asyncio.sleep(0.5) # Небольшая задержка перед следующими отправками
+            
+
+            # Отправка в канал MAX
+            if opp['profit_percent'] >= dataApp.MIN_PROFIT_MAX:
+                await bot.send_message(CHANNEL_ID_MAX, msg, parse_mode="HTML", disable_web_page_preview=True,
+                                    reply_markup=reply_markup)
+                await asyncio.sleep(0.5)
+                
+                await bot.send_message(CHANNEL_ID_MAX_SENA, msg, parse_mode="HTML")
+                await asyncio.sleep(0.5)
+
+            # Отправка в канал ЛИСТИНГОВ (по файлу)
+            parsed_listings = parse_listings_file_to_array()
+            if is_listing_match(opp, parsed_listings):
+                await bot.send_message(
+                    LISTING_ID,
+                    msg,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup
+                )
+                await asyncio.sleep(0.5)
+                
+                await bot.send_message(
+                    LISTING_ID_SENA,
+                    msg,
+                    parse_mode="HTML"
+                )
+                await asyncio.sleep(0.5)
+
+            # Отправка в канал ЛИСТИНГОВ (по символу)
+            all_listed_symbols = get_all_listed_symbols()
+            if opp['symbol'] in all_listed_symbols:
+                await bot.send_message(
+                    LISTING_MONET_ID,
+                    msg,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup
+                )
+                await asyncio.sleep(0.5)
+
+                await bot.send_message(
+                    LISTING_ID_SENA,
+                    msg,
+                    parse_mode="HTML"
+                )
+                await asyncio.sleep(0.5)
+            
 
         # Общая задержка после отправки всех сообщений.
         await asyncio.sleep(2) # Уменьшил с 3 до 2, так как уже были задержки 0.5

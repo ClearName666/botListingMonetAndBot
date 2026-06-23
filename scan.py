@@ -121,8 +121,8 @@ def scan_arbitrage_opportunities_test(
                             continue
                         if buy_type == "spot" and sell_type == "spot":
                             continue
-                        if sell_type == "spot":
-                            continue
+                        # if sell_type == "spot":
+                        #     continue
                         if symbol not in sell_dict:
                             continue
                         # if buy_exchange == sell_exchange:
