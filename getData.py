@@ -43,12 +43,15 @@ def get_mexc_spot_data():
         for item in data:
             symbol = item["symbol"]            # Пример: "BTCUSDT"
             price = float(item["price"])       # Текущая цена
-            # if price == 0:
-            #     print(price, "get_mexc_spot_data")
-            # result[symbol] = price
+
+            # MEXC спот отдаёт "BTCUSDT" без разделителя — приводим к общему
+            # формату BASE_USDT, иначе монеты не матчатся с остальными биржами
+            if not symbol.endswith("USDT"):
+                continue
+            clean_symbol = symbol[:-4] + "_USDT"
 
             if price != 0:
-                result[symbol] = price
+                result[clean_symbol] = price
 
         return result
 
@@ -197,12 +200,24 @@ def get_spot_prices_bingx():
 
         result = {}
         for item in data.get("data", []):
-            symbol = item.get("symbol")
+            symbol = item.get("symbol")        # Пример: "BTC-USDT"
             trades = item.get("trades", [])
-            if trades:
-                price = trades[0].get("price")
-                if price != 0:
-                    result[symbol] = float(price) if price else None
+            if not symbol or not trades:
+                continue
+
+            # BingX отдаёт символ через дефис ("BTC-USDT") — приводим к BASE_USDT
+            clean_symbol = symbol.replace("-", "_")
+            if not clean_symbol.endswith("_USDT"):
+                continue
+
+            price = trades[0].get("price")
+            try:
+                price = float(price)
+            except (TypeError, ValueError):
+                continue
+
+            if price != 0:
+                result[clean_symbol] = price
 
         return result
 
@@ -747,10 +762,21 @@ def get_coinex_spot_data() -> dict:
             return {}
         response.raise_for_status()
         data = response.json()
-        
-        # Формируем словарь: {'BTCUSDT': 68000.5, ...}
-        # API V2 возвращает список в data['data']
-        return {item['market']: float(item['last']) for item in data.get('data', [])}
+
+        # CoinEx отдаёт market как "BTCUSDT" без разделителя — приводим к BASE_USDT,
+        # иначе монеты CoinEx не матчатся ни с одной другой биржей
+        result = {}
+        for item in data.get('data', []):
+            market = item.get('market', '')
+            if not market.endswith('USDT'):
+                continue
+            try:
+                price = float(item['last'])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if price != 0:
+                result[market[:-4] + '_USDT'] = price
+        return result
     except Exception as e:
         print(f"Ошибка при получении спотовых данных: {e}")
         return {}
@@ -767,9 +793,26 @@ def get_coinex_futures_data() -> dict:
             return {}
         response.raise_for_status()
         data = response.json()
-        
-        # Формируем словарь аналогично споту
-        return {item['market']: float(item['last']) for item in data.get('data', [])}
+
+        # CoinEx фьючерс: market "BTCUSDT" -> BASE_USDT; формат как у других фьючерсов
+        # (dict c price/volume), чтобы scan и возможный учёт объёма работали единообразно
+        result = {}
+        for item in data.get('data', []):
+            market = item.get('market', '')
+            if not market.endswith('USDT'):
+                continue
+            try:
+                price = float(item['last'])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if price == 0:
+                continue
+            try:
+                volume = float(item.get('value', item.get('volume', 0)) or 0)
+            except (TypeError, ValueError):
+                volume = 0
+            result[market[:-4] + '_USDT'] = {"price": price, "volume": volume}
+        return result
     except Exception as e:
         print(f"Ошибка при получении фьючерсных данных: {e}")
         return {}

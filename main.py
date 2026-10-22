@@ -21,6 +21,7 @@ from getData import (
 )
 from readFile import create_string_array_from_file, get_all_listed_symbols, is_listing_match, parse_listings_file_to_array
 from scan import scan_arbitrage_opportunities_test, should_send, check_close_opportunities
+from bitgetDelisting import is_bitget_delisting, refresh_bitget_delisting
 
 TOKEN = "8023381531:AAGEyeO3xwoJHOSGbNsuTYrn72FUw94fwOE" # "7663512411:AAFOFh0uVn2_Kmmlr61i0gZuK0fJWHzxY80" # "7380819602:AAEdSde1Ub3uF-dxnKBfBWyOaJwBg-DCD3Y"
 CHANNEL_ID = "-1003192536711" # "-1002467194406" # "-1002332428135"
@@ -72,6 +73,16 @@ def format_opportunity_message(opp):
         f"💰 Объём: {opp['volume']}\n"
         f"📈 Прибыль: <b>{opp['profit_percent']:.2f}%</b>"
     )
+
+    # Предупреждение о делистинге на BitGet: если BitGet участвует в связке
+    # и монета в списке на снятие с торгов — связка может не исполниться.
+    if opp["buy_exchange"] == "BitGet" or opp["sell_exchange"] == "BitGet":
+        if is_bitget_delisting(opp["symbol"]):
+            msg = (
+                "⚠️ <b>ВНИМАНИЕ: делистинг на BitGet</b> — монета в списке на снятие "
+                "с торгов, связка может не исполниться.\n\n"
+            ) + msg
+
     if opp["buy_exchange"] == "Coinex" or opp["sell_exchange"] == "Coinex":
         print(msg)
     return msg
@@ -460,13 +471,31 @@ async def send_closed_opps():
 #     else:
 #         await message.answer('Черный список пуст.')
 
+# Фоновое обновление списка делистингов BitGet (сетевой запрос в отдельном потоке,
+# чтобы не блокировать event loop). is_bitget_delisting() читает уже готовый кэш.
+async def refresh_bitget_delisting_loop():
+    while True:
+        try:
+            await asyncio.to_thread(refresh_bitget_delisting)
+        except Exception as e:
+            print(f"Ошибка обновления делистингов BitGet: {e}")
+        await asyncio.sleep(600)
+
+
 async def main():
     await set_commands(bot)
     await bot.delete_webhook(drop_pending_updates=True)
 
     loop = asyncio.get_event_loop()
 
+    # Сразу подтягиваем список делистингов до старта сканера
+    try:
+        await asyncio.to_thread(refresh_bitget_delisting, True)
+    except Exception as e:
+        print(f"Первичная загрузка делистингов BitGet не удалась: {e}")
+
     # Запускаем фоновые задачи
+    loop.create_task(refresh_bitget_delisting_loop())
     loop.create_task(send_arbitrage_opps())
     loop.create_task(send_closed_opps())
 
