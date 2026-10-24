@@ -3,6 +3,7 @@
 
 import asyncio
 import threading
+import time
 
 # import requests
 from aiogram import Bot, Dispatcher, Router, F
@@ -499,6 +500,12 @@ funding_forecaster = FundingForecaster()
 
 async def funding_train_loop():
     """Переобучение нейросети по истории фандинга (в отдельном потоке)."""
+    # Если на диске свежая модель — не переобучаем сразу при перезапуске
+    trained_at = funding_forecaster.trained_at
+    if funding_forecaster.model is not None and trained_at:
+        wait = dataApp.FUNDING_RETRAIN_INTERVAL - (time.time() - trained_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
     while True:
         try:
             await asyncio.to_thread(funding_forecaster.train)

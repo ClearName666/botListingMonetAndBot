@@ -12,6 +12,7 @@
 
 import math
 import os
+import random
 import re
 import threading
 import time
@@ -425,22 +426,46 @@ class FundingForecaster:
             return make_pipeline(
                 StandardScaler(),
                 MLPClassifier(hidden_layer_sizes=(32, 16), alpha=1e-3, max_iter=800,
-                              early_stopping=len(y) >= 200, random_state=42),
+                              random_state=42),
             )
 
-        # Честная проверка: тестовые монеты не участвуют в обучении
+        def balanced(xs, ys):
+            """Случаев «держался» мало — дублируем их, чтобы классов было поровну.
+            Иначе сеть учится всегда отвечать «не продержится»."""
+            rnd = random.Random(42)
+            pos_idx = [i for i, v in enumerate(ys) if v == 1]
+            neg_idx = [i for i, v in enumerate(ys) if v == 0]
+            small, big = (pos_idx, neg_idx) if len(pos_idx) < len(neg_idx) else (neg_idx, pos_idx)
+            if not small:
+                return xs, ys
+            extra = [rnd.choice(small) for _ in range(len(big) - len(small))]
+            idx = list(range(len(ys))) + extra
+            rnd.shuffle(idx)
+            return [xs[i] for i in idx], [ys[i] for i in idx]
+
+        # Честная проверка: тестовые монеты не участвуют в обучении.
+        # Считаем не общую «точность» (при перекосе классов она бессмысленна),
+        # а сколько держащихся случаев сеть нашла и сколько из её сигналов верные.
         acc_text = ""
         try:
             if len(set(groups)) >= 5:
-                split = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
-                tr, te = next(split.split(X, y, groups))
-                m = new_model().fit([X[i] for i in tr], [y[i] for i in tr])
-                acc = m.score([X[i] for i in te], [y[i] for i in te])
-                acc_text = f", точность на отложенных монетах {acc * 100:.0f}%"
+                for seed in range(20):
+                    split = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)
+                    tr, te = next(split.split(X, y, groups))
+                    if sum(y[i] for i in te) >= 3:
+                        break
+                y_te = [y[i] for i in te]
+                if sum(y_te) > 0:
+                    m = new_model().fit(*balanced([X[i] for i in tr], [y[i] for i in tr]))
+                    pred = m.predict_proba([X[i] for i in te])[:, 1] >= dataApp.FUNDING_MIN_PROBA
+                    hit = sum(1 for p, t in zip(pred, y_te) if p and t)
+                    fired = int(sum(pred))
+                    acc_text = (f"; проверка на других монетах: нашла {hit} из {sum(y_te)} держащихся, "
+                                f"верных сигналов {hit} из {fired}")
         except Exception as e:
             print(f"[funding] проверка модели не удалась: {e}")
 
-        model = new_model().fit(X, y)
+        model = new_model().fit(*balanced(X, y))
         info = (f"обучена {time.strftime('%Y-%m-%d %H:%M')} на {len(y)} примерах "
                 f"({pos} держались / {neg} нет){acc_text}")
         with self._lock:
