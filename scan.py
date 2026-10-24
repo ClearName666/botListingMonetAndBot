@@ -135,6 +135,9 @@ def scan_arbitrage_opportunities_test(
                             continue
                         if buy_type == "spot" and sell_type == "spot":
                             continue
+                        # Фьючерс → Спот не нужен: оставляем только Спот → Фьючерс и Фьючерс → Фьючерс
+                        if buy_type == "futures" and sell_type == "spot":
+                            continue
                         # if sell_type == "spot":
                         #     continue
                         if symbol not in sell_dict:
