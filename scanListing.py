@@ -18,7 +18,9 @@ EXCHANGES = [
     'xt',
     'hyperliquid',
     'okx',
-    'coinex'
+    'coinex',
+    'phemex',
+    'aster'
 ]
 
 # Словарь для преобразования внутреннего имени в требуемое внешнее имя (для файла listings.txt)
@@ -33,7 +35,9 @@ EXCHANGE_MAPPING = {
     'xt': 'XT',
     'hyperliquid': 'Hyperliquid',
     'okx': 'OKX',
-    'coinex': 'Coinex'
+    'coinex': 'Coinex',
+    'phemex': 'Phemex',
+    'aster': 'Aster'
 }
 
 # Имя файла для хранения известных символов (база данных)
@@ -187,6 +191,13 @@ def fetch_and_find_new_listings(known_symbols):
             
             # --- Логика определения новых листингов ---
             
+            # Биржа добавлена впервые — просто запоминаем её монеты,
+            # иначе все её пары разом уйдут в канал как "новые листинги"
+            if exchange_id not in known_symbols:
+                current_symbols_all[exchange_id] = list(current_symbols_filtered)
+                print(f"ℹ️ {exchange_id.upper()}: первая загрузка, сохранено {len(current_symbols_filtered)} пар без уведомлений")
+                continue
+
             known = set(known_symbols.get(exchange_id, []))
             new_coins_for_exchange = current_symbols_filtered - known
             

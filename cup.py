@@ -30,6 +30,8 @@ cach = {
     "XT":       {"spot": {}, "futures": {}},
     "Hyperliquid": {"spot": {}, "futures": {}},
     "OKX":      {"spot": {}, "futures": {}},
+    "Phemex":   {"spot": {}, "futures": {}},
+    "Aster":    {"spot": {}, "futures": {}},
 }
 
 def cache_get(exchange: str, market_type: str, symbol: str):
@@ -2035,3 +2037,118 @@ def get_coinex_order_book_futures(symbol="BTC_USDT", limit=50):
         except Exception:
             pass
         return 0, 0, 0, 0
+
+
+# ==================== Phemex / Aster ====================
+
+def _book_result(exchange, market_type, clean_symbol, bids, asks):
+    """Считает средние цены по стакану (как для остальных бирж) и кладёт в кэш."""
+    average_bid, volume_bids = weighted_average(bids)
+    average_ask, volume_asks = weighted_average(asks)
+    cache_set(exchange, market_type, clean_symbol, {
+        "average_bid": average_bid,
+        "average_ask": average_ask,
+        "volume_asks": volume_asks,
+        "volume_bids": volume_bids,
+    })
+    return average_bid, average_ask, volume_asks, volume_bids
+
+
+def _book_fail(exchange, market_type, clean_symbol):
+    cache_set(exchange, market_type, clean_symbol, {
+        "average_bid": None, "average_ask": None, "volume_asks": None, "volume_bids": None
+    })
+    return None, None, None, None
+
+
+def _cached_book(exchange, market_type, clean_symbol):
+    cached = cache_get(exchange, market_type, clean_symbol)
+    if cached:
+        return (cached["average_bid"], cached["average_ask"],
+                cached["volume_asks"], cached["volume_bids"])
+    return None
+
+
+def get_order_book_phemex_futures(symbol="BTC_USDT"):
+    from getData import PHEMEX_FUT_SYMBOLS
+    clean_symbol = symbol.replace("_", "")
+    cached = _cached_book("Phemex", "futures", clean_symbol)
+    if cached:
+        return cached
+
+    raw_symbol, mult = PHEMEX_FUT_SYMBOLS.get(symbol, (clean_symbol, 1))
+    try:
+        response = requests.get("https://api.phemex.com/md/v2/orderbook",
+                                params={"symbol": raw_symbol}, timeout=10)
+        data = response.json()
+        result = data.get("result") or {}
+        book = result.get("orderbook_p") or result.get("book") or {}
+        # цены и объёмы — строки в реальных единицах; учитываем множитель контракта
+        bids = [[float(p[0]) / mult, float(p[1]) * mult] for p in book.get("bids", [])]
+        asks = [[float(p[0]) / mult, float(p[1]) * mult] for p in book.get("asks", [])]
+        if not bids or not asks:
+            return _book_fail("Phemex", "futures", clean_symbol)
+        return _book_result("Phemex", "futures", clean_symbol, bids, asks)
+    except Exception as e:
+        print(f"Ошибка при получении стакана Phemex futures: {e}")
+        return _book_fail("Phemex", "futures", clean_symbol)
+
+
+def get_order_book_phemex_spot(symbol="BTC_USDT"):
+    from getData import _get_phemex_ccxt
+    clean_symbol = symbol.replace("_", "")
+    cached = _cached_book("Phemex", "spot", clean_symbol)
+    if cached:
+        return cached
+    try:
+        ex = _get_phemex_ccxt()
+        ob = ex.fetch_order_book(symbol.replace("_", "/"), limit=30)
+        bids = [[float(p[0]), float(p[1])] for p in ob.get("bids", [])]
+        asks = [[float(p[0]), float(p[1])] for p in ob.get("asks", [])]
+        if not bids or not asks:
+            return _book_fail("Phemex", "spot", clean_symbol)
+        return _book_result("Phemex", "spot", clean_symbol, bids, asks)
+    except Exception as e:
+        print(f"Ошибка при получении стакана Phemex spot: {e}")
+        return _book_fail("Phemex", "spot", clean_symbol)
+
+
+def get_order_book_aster_futures(symbol="BTC_USDT"):
+    from getData import ASTER_FUT_SYMBOLS
+    clean_symbol = symbol.replace("_", "")
+    cached = _cached_book("Aster", "futures", clean_symbol)
+    if cached:
+        return cached
+
+    raw_symbol, mult = ASTER_FUT_SYMBOLS.get(symbol, (clean_symbol, 1))
+    try:
+        response = requests.get("https://fapi.asterdex.com/fapi/v1/depth",
+                                params={"symbol": raw_symbol, "limit": LIMIT_ORDER_BOOK}, timeout=10)
+        data = response.json()
+        bids = [[float(p[0]) / mult, float(p[1]) * mult] for p in data.get("bids", [])]
+        asks = [[float(p[0]) / mult, float(p[1]) * mult] for p in data.get("asks", [])]
+        if not bids or not asks:
+            return _book_fail("Aster", "futures", clean_symbol)
+        return _book_result("Aster", "futures", clean_symbol, bids, asks)
+    except Exception as e:
+        print(f"Ошибка при получении стакана Aster futures: {e}")
+        return _book_fail("Aster", "futures", clean_symbol)
+
+
+def get_order_book_aster_spot(symbol="BTC_USDT"):
+    clean_symbol = symbol.replace("_", "")
+    cached = _cached_book("Aster", "spot", clean_symbol)
+    if cached:
+        return cached
+    try:
+        response = requests.get("https://sapi.asterdex.com/api/v1/depth",
+                                params={"symbol": clean_symbol, "limit": LIMIT_ORDER_BOOK}, timeout=10)
+        data = response.json()
+        bids = [[float(p[0]), float(p[1])] for p in data.get("bids", [])]
+        asks = [[float(p[0]), float(p[1])] for p in data.get("asks", [])]
+        if not bids or not asks:
+            return _book_fail("Aster", "spot", clean_symbol)
+        return _book_result("Aster", "spot", clean_symbol, bids, asks)
+    except Exception as e:
+        print(f"Ошибка при получении стакана Aster spot: {e}")
+        return _book_fail("Aster", "spot", clean_symbol)

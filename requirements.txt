@@ -3,3 +3,6 @@ requests
 ccxt
 certifi
 urllib3
+scikit-learn
+numpy
+joblib

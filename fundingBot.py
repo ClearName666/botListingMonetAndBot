@@ -1,0 +1,647 @@
+# Фандинг-бот: связка Bybit LONG / MEXC SHORT.
+#
+# Условия сигнала (все должны выполниться):
+#   1. Дельта фандинга >= FUNDING_MIN_DELTA (по умолчанию 0.2%).
+#   2. Разница цен ((цена Bybit − цена MEXC) / цена MEXC * 100) <= этой дельты.
+#      Берём реальные цены входа: ask на Bybit (покупаем) и bid на MEXC (продаём).
+#   3. По истории фандинга дельта держалась выше порога не меньше FUNDING_MIN_HISTORY_HOURS.
+#   4. Нейросеть прогнозирует, что дельта продержится ещё FUNDING_FORECAST_HOURS часов
+#      (вероятность >= FUNDING_MIN_PROBA).
+#
+# Запуск отдельно для проверки (без Телеграма):  python fundingBot.py
+
+import math
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+import dataApp
+
+BYBIT_API = "https://api.bybit.com"
+MEXC_API = "https://contract.mexc.com"
+
+MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "funding_model.pkl")
+
+_session = requests.Session()
+_session.mount("https://", HTTPAdapter(max_retries=Retry(
+    total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])))
+
+HOUR_MS = 3_600_000
+
+
+def _get(url, params=None, timeout=10):
+    r = _session.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def _f(x, default=None):
+    try:
+        if x is None or x == "":
+            return default
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================ ТЕКУЩИЕ ДАННЫЕ ============================
+
+_BYBIT_MULT_RE = re.compile(r'^(1000000|100000|10000|1000)([A-Z0-9]+)USDT$')
+_BYBIT_MULT_SUFFIX_RE = re.compile(r'^([A-Z]+)(1000|10000)USDT$')   # SHIB1000USDT
+
+
+def _bybit_clean(raw):
+    m = _BYBIT_MULT_RE.match(raw)
+    if m:
+        return m.group(2) + "_USDT", int(m.group(1))
+    m = _BYBIT_MULT_SUFFIX_RE.match(raw)
+    if m:
+        return m.group(1) + "_USDT", int(m.group(2))
+    if raw.endswith("USDT") and len(raw) > 4:
+        return raw[:-4] + "_USDT", 1
+    return None, None
+
+
+def fetch_bybit_linear():
+    """{BASE_USDT: {raw, mult, bid, ask, last, rate(%), next_ts, turnover}}"""
+    data = _get(f"{BYBIT_API}/v5/market/tickers", {"category": "linear"})
+    out = {}
+    for t in (data.get("result") or {}).get("list", []) or []:
+        raw = t.get("symbol", "")
+        clean, mult = _bybit_clean(raw)
+        if not clean:
+            continue
+        rate = _f(t.get("fundingRate"))
+        last = _f(t.get("lastPrice"), 0)
+        if rate is None or not last:
+            continue
+        bid = _f(t.get("bid1Price"), 0) or last
+        ask = _f(t.get("ask1Price"), 0) or last
+        out[clean] = {
+            "raw": raw, "mult": mult,
+            "bid": bid / mult, "ask": ask / mult, "last": last / mult,
+            "rate": rate * 100,
+            "next_ts": int(_f(t.get("nextFundingTime"), 0) or 0),
+            "turnover": _f(t.get("turnover24h"), 0),
+        }
+    return out
+
+
+_bybit_intervals = {}
+_bybit_intervals_ts = 0.0
+
+
+def fetch_bybit_intervals():
+    """{RAWSYMBOL: интервал начисления в часах}. Кэш на час."""
+    global _bybit_intervals, _bybit_intervals_ts
+    if _bybit_intervals and time.time() - _bybit_intervals_ts < 3600:
+        return _bybit_intervals
+    out, cursor = {}, None
+    for _ in range(20):
+        params = {"category": "linear", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        data = _get(f"{BYBIT_API}/v5/market/instruments-info", params)
+        res = data.get("result") or {}
+        for it in res.get("list", []) or []:
+            minutes = _f(it.get("fundingInterval"))
+            if minutes:
+                out[it.get("symbol")] = max(1, round(minutes / 60))
+        cursor = res.get("nextPageCursor")
+        if not cursor:
+            break
+    if out:
+        _bybit_intervals, _bybit_intervals_ts = out, time.time()
+    return _bybit_intervals
+
+
+def fetch_mexc_tickers():
+    """{BASE_USDT: {bid, ask, last, rate(%), turnover}}"""
+    data = _get(f"{MEXC_API}/api/v1/contract/ticker")
+    out = {}
+    for t in data.get("data", []) or []:
+        sym = t.get("symbol", "")
+        if not sym.endswith("_USDT"):
+            continue
+        rate = _f(t.get("fundingRate"))
+        last = _f(t.get("lastPrice"), 0)
+        if rate is None or not last:
+            continue
+        out[sym] = {
+            "bid": _f(t.get("bid1"), 0) or last,
+            "ask": _f(t.get("ask1"), 0) or last,
+            "last": last,
+            "rate": rate * 100,
+            "turnover": _f(t.get("amount24"), 0),
+        }
+    return out
+
+
+_mexc_info_cache = {}
+
+
+def fetch_mexc_funding_info(symbol):
+    """{rate(%), interval(ч), next_ts} для одной монеты MEXC. Кэш 5 минут."""
+    cached = _mexc_info_cache.get(symbol)
+    if cached and time.time() - cached[0] < 300:
+        return cached[1]
+    data = _get(f"{MEXC_API}/api/v1/contract/funding_rate/{symbol}")
+    d = data.get("data") or {}
+    info = {
+        "rate": (_f(d.get("fundingRate"), 0) or 0) * 100,
+        "interval": int(_f(d.get("collectCycle"), 8) or 8),
+        "next_ts": int(_f(d.get("nextSettleTime"), 0) or 0),
+    }
+    _mexc_info_cache[symbol] = (time.time(), info)
+    return info
+
+
+# ============================ ИСТОРИЯ ФАНДИНГА ============================
+
+_hist_cache = {}
+HIST_TTL = 1800
+
+
+def _cached_hist(key, loader):
+    c = _hist_cache.get(key)
+    if c and time.time() - c[0] < HIST_TTL:
+        return c[1]
+    val = loader()
+    _hist_cache[key] = (time.time(), val)
+    return val
+
+
+def fetch_bybit_history(raw_symbol):
+    """[(ts_ms, rate%)] по возрастанию времени (до 200 последних начислений)."""
+    def load():
+        data = _get(f"{BYBIT_API}/v5/market/funding/history",
+                    {"category": "linear", "symbol": raw_symbol, "limit": 200})
+        rows = (data.get("result") or {}).get("list", []) or []
+        out = [(int(r["fundingRateTimestamp"]), float(r["fundingRate"]) * 100)
+               for r in rows if r.get("fundingRateTimestamp") and r.get("fundingRate") not in (None, "")]
+        return sorted(out)
+    return _cached_hist(("bybit", raw_symbol), load)
+
+
+def fetch_mexc_history(symbol):
+    """[(ts_ms, rate%)] по возрастанию времени (до 100 последних начислений)."""
+    def load():
+        data = _get(f"{MEXC_API}/api/v1/contract/funding_rate/history",
+                    {"symbol": symbol, "page_num": 1, "page_size": 100})
+        rows = (data.get("data") or {}).get("resultList", []) or []
+        out = [(int(r["settleTime"]), float(r["fundingRate"]) * 100)
+               for r in rows if r.get("settleTime") and r.get("fundingRate") is not None]
+        return sorted(out)
+    return _cached_hist(("mexc", symbol), load)
+
+
+def hourly_rates(history):
+    """
+    Раскладывает начисления по часам: {номер_часа: ставка% в час}.
+    Ставка начисления в момент T покрывает период (T − интервал, T].
+    Интервал берём из разницы соседних начислений (1..8 ч).
+    """
+    out = {}
+    if not history:
+        return out
+    for i, (ts, rate) in enumerate(history):
+        if i > 0:
+            gap = round((ts - history[i - 1][0]) / HOUR_MS)
+        elif len(history) > 1:
+            gap = round((history[1][0] - ts) / HOUR_MS)
+        else:
+            gap = 8
+        interval = min(max(gap, 1), 8)
+        end_h = int(round(ts / HOUR_MS))
+        per_hour = rate / interval
+        for h in range(end_h - interval + 1, end_h + 1):
+            out[h] = per_hour
+    return out
+
+
+def calc_delta(bybit_pct, mexc_pct, mode=None):
+    """Дельта фандинга для связки LONG Bybit / SHORT MEXC (в %)."""
+    mode = mode or dataApp.FUNDING_DELTA_MODE
+    if mode == "abs":
+        return abs(bybit_pct) - abs(mexc_pct)
+    return mexc_pct - bybit_pct
+
+
+def _norm_hours():
+    return dataApp.FUNDING_NORMALIZE_HOURS or 8
+
+
+def delta_series(bybit_hist, mexc_hist):
+    """
+    Почасовой ряд дельты (приведённой к FUNDING_NORMALIZE_HOURS).
+    Возвращает список (час, дельта%, bybit%, mexc%) по возрастанию; разрывы сохраняются.
+    """
+    hb, hm = hourly_rates(bybit_hist), hourly_rates(mexc_hist)
+    n = _norm_hours()
+    series = []
+    for h in sorted(set(hb) & set(hm)):
+        b, m = hb[h] * n, hm[h] * n
+        series.append((h, calc_delta(b, m), b, m))
+    return series
+
+
+def streak_hours(series, threshold):
+    """Сколько последних часов подряд (без разрывов) дельта была >= порога."""
+    count, prev_h = 0, None
+    for h, d, _, _ in reversed(series):
+        if prev_h is not None and prev_h - h != 1:
+            break
+        if d < threshold:
+            break
+        count += 1
+        prev_h = h
+    return count
+
+
+# ============================ НЕЙРОСЕТЬ ============================
+
+FEATURE_NAMES = [
+    "delta_now", "mean_8h", "mean_24h", "mean_72h", "std_24h",
+    "change_8h", "change_24h", "log_streak", "share_above_72h",
+    "bybit_now", "mexc_now", "bybit_interval",
+]
+
+
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _std(xs):
+    if len(xs) < 2:
+        return 0.0
+    m = _mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+def make_features(deltas, bybit_now, mexc_now, bybit_interval, threshold):
+    """deltas — почасовая дельта, последний элемент = текущий момент."""
+    d = deltas
+    cur = d[-1]
+    streak = 0
+    for x in reversed(d):
+        if x < threshold:
+            break
+        streak += 1
+    last72 = d[-72:]
+    return [
+        cur,
+        _mean(d[-8:]),
+        _mean(d[-24:]),
+        _mean(last72),
+        _std(d[-24:]),
+        cur - d[-9] if len(d) >= 9 else 0.0,
+        cur - d[-25] if len(d) >= 25 else 0.0,
+        math.log1p(streak),
+        sum(1 for x in last72 if x >= threshold) / len(last72),
+        bybit_now,
+        mexc_now,
+        float(bybit_interval),
+    ]
+
+
+def _contiguous_runs(series):
+    """Разбивает ряд на непрерывные по часам куски."""
+    runs, cur = [], []
+    for row in series:
+        if cur and row[0] - cur[-1][0] != 1:
+            runs.append(cur)
+            cur = []
+        cur.append(row)
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def build_samples(series, bybit_interval, threshold, horizon, step=2):
+    """
+    Обучающие примеры из одного ряда.
+    Берём моменты, где дельта уже заметная (>= половины порога), и смотрим,
+    продержалась ли средняя дельта >= порога следующие `horizon` часов.
+    """
+    X, y = [], []
+    min_hist = 24
+    for run in _contiguous_runs(series):
+        deltas = [r[1] for r in run]
+        for t in range(min_hist, len(run) - horizon, step):
+            if deltas[t] < threshold * 0.5:
+                continue
+            feats = make_features(deltas[:t + 1], run[t][2], run[t][3], bybit_interval, threshold)
+            future = deltas[t + 1:t + 1 + horizon]
+            X.append(feats)
+            y.append(1 if _mean(future) >= threshold else 0)
+    return X, y
+
+
+class FundingForecaster:
+    """Небольшая нейросеть (MLP), которая учится на истории фандинга Bybit/MEXC."""
+
+    MIN_SAMPLES = 60
+    MIN_PER_CLASS = 10
+
+    def __init__(self):
+        self.model = None
+        self.trained_at = None
+        self.info = "не обучена"
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        try:
+            import joblib
+            if os.path.exists(MODEL_FILE):
+                bundle = joblib.load(MODEL_FILE)
+                if bundle.get("features") == FEATURE_NAMES:
+                    self.model = bundle["model"]
+                    self.trained_at = bundle.get("trained_at")
+                    self.info = bundle.get("info", "загружена с диска")
+                    print(f"[funding] Нейросеть загружена: {self.info}")
+        except Exception as e:
+            print(f"[funding] Не удалось загрузить модель: {e}")
+
+    def train(self, symbols_limit=None):
+        """Собирает историю по общим монетам Bybit/MEXC и обучает MLP. Долгая операция."""
+        try:
+            from sklearn.neural_network import MLPClassifier
+            from sklearn.pipeline import make_pipeline
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.model_selection import GroupShuffleSplit
+            import joblib
+        except ImportError:
+            self.info = "scikit-learn не установлен (pip install scikit-learn) — работает эвристика"
+            print(f"[funding] {self.info}")
+            return False
+
+        threshold = dataApp.FUNDING_MIN_DELTA
+        horizon = dataApp.FUNDING_FORECAST_HOURS
+
+        bybit = fetch_bybit_linear()
+        mexc = fetch_mexc_tickers()
+        intervals = fetch_bybit_intervals()
+        common = [s for s in bybit if s in mexc
+                  and bybit[s]["turnover"] >= dataApp.FUNDING_MIN_TURNOVER
+                  and mexc[s]["turnover"] >= dataApp.FUNDING_MIN_TURNOVER]
+        common.sort(key=lambda s: -abs(bybit[s]["rate"] - mexc[s]["rate"]))
+        if symbols_limit:
+            common = common[:symbols_limit]
+        print(f"[funding] Обучение: собираю историю по {len(common)} монетам...")
+
+        def collect(sym):
+            try:
+                raw = bybit[sym]["raw"]
+                series = delta_series(fetch_bybit_history(raw), fetch_mexc_history(sym))
+                time.sleep(0.15)  # бережём лимиты MEXC
+                return sym, build_samples(series, intervals.get(raw, 8), threshold, horizon)
+            except Exception as e:
+                print(f"[funding] история {sym}: {e}")
+                return sym, ([], [])
+
+        X, y, groups = [], [], []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for sym, (xs, ys) in pool.map(collect, common):
+                X += xs
+                y += ys
+                groups += [sym] * len(xs)
+
+        pos = sum(y)
+        neg = len(y) - pos
+        if len(y) < self.MIN_SAMPLES or pos < self.MIN_PER_CLASS or neg < self.MIN_PER_CLASS:
+            self.info = (f"мало данных для обучения ({len(y)} примеров: {pos} держались / {neg} нет) "
+                         f"— работает эвристика по истории")
+            print(f"[funding] {self.info}")
+            return False
+
+        def new_model():
+            return make_pipeline(
+                StandardScaler(),
+                MLPClassifier(hidden_layer_sizes=(32, 16), alpha=1e-3, max_iter=800,
+                              early_stopping=len(y) >= 200, random_state=42),
+            )
+
+        # Честная проверка: тестовые монеты не участвуют в обучении
+        acc_text = ""
+        try:
+            if len(set(groups)) >= 5:
+                split = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
+                tr, te = next(split.split(X, y, groups))
+                m = new_model().fit([X[i] for i in tr], [y[i] for i in tr])
+                acc = m.score([X[i] for i in te], [y[i] for i in te])
+                acc_text = f", точность на отложенных монетах {acc * 100:.0f}%"
+        except Exception as e:
+            print(f"[funding] проверка модели не удалась: {e}")
+
+        model = new_model().fit(X, y)
+        info = (f"обучена {time.strftime('%Y-%m-%d %H:%M')} на {len(y)} примерах "
+                f"({pos} держались / {neg} нет){acc_text}")
+        with self._lock:
+            self.model = model
+            self.trained_at = time.time()
+            self.info = info
+        try:
+            joblib.dump({"model": model, "features": FEATURE_NAMES,
+                         "trained_at": self.trained_at, "info": info}, MODEL_FILE)
+        except Exception as e:
+            print(f"[funding] не удалось сохранить модель: {e}")
+        print(f"[funding] Нейросеть {info}")
+        return True
+
+    def predict(self, deltas, bybit_now, mexc_now, bybit_interval, history_streak):
+        """
+        Возвращает (вероятность или None, продержится_долго: bool, метод: str).
+        """
+        with self._lock:
+            model = self.model
+        if model is not None and deltas:
+            try:
+                feats = make_features(deltas, bybit_now, mexc_now, bybit_interval,
+                                      dataApp.FUNDING_MIN_DELTA)
+                proba = float(model.predict_proba([feats])[0][1])
+                return proba, proba >= dataApp.FUNDING_MIN_PROBA, "нейросеть"
+            except Exception as e:
+                print(f"[funding] ошибка прогноза: {e}")
+        ok = history_streak >= dataApp.FUNDING_FALLBACK_HOURS
+        return None, ok, "эвристика (нейросеть ещё не обучена)"
+
+
+# ============================ СКАНЕР ============================
+
+def _links(symbol):
+    base = symbol.replace("_USDT", "")
+    return (f"https://www.bybit.com/trade/usdt/{base}USDT",
+            f"https://www.mexc.com/futures/contract/{base}_USDT")
+
+
+def scan_funding_opportunities(forecaster, verbose=False):
+    threshold = dataApp.FUNDING_MIN_DELTA
+    norm = dataApp.FUNDING_NORMALIZE_HOURS
+
+    bybit = fetch_bybit_linear()
+    mexc = fetch_mexc_tickers()
+    intervals = fetch_bybit_intervals()
+
+    # Быстрый отсев: на одной из бирж должен быть заметный фандинг
+    candidates = []
+    for sym, b in bybit.items():
+        m = mexc.get(sym)
+        if not m:
+            continue
+        if b["turnover"] < dataApp.FUNDING_MIN_TURNOVER or m["turnover"] < dataApp.FUNDING_MIN_TURNOVER:
+            continue
+        if not (0.5 <= b["last"] / m["last"] <= 2):   # разные контракты под одним тикером
+            continue
+        b_int = intervals.get(b["raw"], 8)
+        b_norm = b["rate"] * (norm / b_int) if norm else b["rate"]
+        # максимально возможная дельта при любом интервале MEXC (1..8ч)
+        m_max = abs(m["rate"]) * (norm if norm else 1)
+        if abs(b_norm) + m_max < threshold:
+            continue
+        candidates.append(sym)
+
+    stats = {"candidates": len(candidates), "delta": 0, "price": 0, "history": 0, "forecast": 0}
+    opps = []
+    for sym in candidates:
+        b, m = bybit[sym], mexc[sym]
+        try:
+            m_info = fetch_mexc_funding_info(sym)
+        except Exception as e:
+            print(f"[funding] MEXC funding_rate {sym}: {e}")
+            continue
+        b_int = intervals.get(b["raw"], 8)
+        m_int = m_info["interval"] or 8
+        m_rate = m_info["rate"] if m_info["rate"] else m["rate"]
+
+        b_norm = b["rate"] * (norm / b_int) if norm else b["rate"]
+        m_norm = m_rate * (norm / m_int) if norm else m_rate
+        delta = calc_delta(b_norm, m_norm)
+
+        # 1. дельта фандинга
+        if delta < threshold:
+            continue
+        stats["delta"] += 1
+
+        # 2. разница цен: покупаем на Bybit по ask, продаём на MEXC по bid
+        price_diff = (b["ask"] - m["bid"]) / m["bid"] * 100
+        if price_diff > delta:
+            continue
+        stats["price"] += 1
+
+        # 3. история
+        try:
+            series = delta_series(fetch_bybit_history(b["raw"]), fetch_mexc_history(sym))
+        except Exception as e:
+            print(f"[funding] история {sym}: {e}")
+            continue
+        hist_streak = streak_hours(series, threshold)
+        if hist_streak < dataApp.FUNDING_MIN_HISTORY_HOURS:
+            continue
+        stats["history"] += 1
+
+        # 4. прогноз нейросети (последний элемент — текущая дельта)
+        last_run = _contiguous_runs(series)[-1] if series else []
+        deltas = [r[1] for r in last_run] + [delta]
+        proba, long_enough, method = forecaster.predict(deltas, b_norm, m_norm, b_int, hist_streak)
+        if not long_enough:
+            continue
+        stats["forecast"] += 1
+
+        bybit_link, mexc_link = _links(sym)
+        opps.append({
+            "symbol": sym,
+            "bybit_price": b["ask"], "mexc_price": m["bid"],
+            "bybit_rate": b["rate"], "mexc_rate": m_rate,
+            "bybit_interval": b_int, "mexc_interval": m_int,
+            "bybit_norm": b_norm, "mexc_norm": m_norm,
+            "bybit_next": b["next_ts"], "mexc_next": m_info["next_ts"],
+            "delta": delta, "price_diff": price_diff,
+            "history_hours": hist_streak,
+            "proba": proba, "method": method,
+            "bybit_link": bybit_link, "mexc_link": mexc_link,
+        })
+
+    if verbose:
+        print(f"[funding] кандидатов {stats['candidates']}, прошли дельту {stats['delta']}, "
+              f"цену {stats['price']}, историю {stats['history']}, прогноз {stats['forecast']}")
+    opps.sort(key=lambda o: -(o["delta"] - max(o["price_diff"], 0)))
+    return opps
+
+
+# ============================ СООБЩЕНИЯ ============================
+
+_last_sent = {}
+
+
+def should_send_funding(opp):
+    key = opp["symbol"]
+    prev = _last_sent.get(key)
+    now = time.time()
+    if prev is None or abs(opp["delta"] - prev[1]) >= dataApp.FUNDING_RESEND_DELTA \
+            or now - prev[0] >= dataApp.FUNDING_RESEND_SECONDS:
+        _last_sent[key] = (now, opp["delta"])
+        return True
+    return False
+
+
+def _fmt_price(p):
+    return f"{p:.8f}".rstrip("0").rstrip(".") if p < 1 else f"{p:.4f}".rstrip("0").rstrip(".")
+
+
+def _until(ts_ms):
+    if not ts_ms:
+        return ""
+    left = int(ts_ms / 1000 - time.time())
+    if left <= 0:
+        return ""
+    return f", начисление через {left // 3600}ч {left % 3600 // 60}м"
+
+
+def format_funding_message(opp):
+    norm = dataApp.FUNDING_NORMALIZE_HOURS
+    per = f" за {norm}ч" if norm else ""
+
+    def rate_line(rate, interval, rate_norm):
+        s = f"{rate:+.4f}% / {interval}ч"
+        if norm and interval != norm:
+            s += f" (≈ {rate_norm:+.4f}%{per})"
+        return s
+
+    if opp["proba"] is not None:
+        forecast = (f"🤖 Прогноз нейросети: продержится ≥{dataApp.FUNDING_FORECAST_HOURS}ч "
+                    f"с вероятностью <b>{opp['proba'] * 100:.0f}%</b>")
+    else:
+        forecast = f"🤖 Прогноз: {opp['method']} — держится ≥{dataApp.FUNDING_FALLBACK_HOURS}ч"
+
+    return (
+        f"💸 <b>Фандинг: Bybit LONG / MEXC SHORT</b>\n"
+        f"Монета: <b>{opp['symbol']}</b>\n"
+        f"🟢 Лонг Bybit: <a href='{opp['bybit_link']}'>${_fmt_price(opp['bybit_price'])}</a> — фандинг "
+        f"{rate_line(opp['bybit_rate'], opp['bybit_interval'], opp['bybit_norm'])}{_until(opp['bybit_next'])}\n"
+        f"🔴 Шорт MEXC: <a href='{opp['mexc_link']}'>${_fmt_price(opp['mexc_price'])}</a> — фандинг "
+        f"{rate_line(opp['mexc_rate'], opp['mexc_interval'], opp['mexc_norm'])}{_until(opp['mexc_next'])}\n"
+        f"📊 Дельта фандинга: <b>{opp['delta']:.3f}%</b>{per}\n"
+        f"📉 Разница цен: {opp['price_diff']:.3f}% ≤ {opp['delta']:.3f}% ✅\n"
+        f"⏳ По истории держится: {opp['history_hours']} ч\n"
+        f"{forecast}"
+    )
+
+
+if __name__ == "__main__":
+    fc = FundingForecaster()
+    if fc.model is None:
+        fc.train()
+    print(f"[funding] модель: {fc.info}")
+    found = scan_funding_opportunities(fc, verbose=True)
+    for o in found:
+        print(format_funding_message(o))
+        print()
+    if not found:
+        print("Сейчас подходящих связок нет.")

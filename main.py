@@ -17,11 +17,13 @@ from getData import (
     get_coinex_futures_data, get_coinex_spot_data, get_gateio_spot_data, get_htx_futures_data, get_hyperliquid_data_futures, get_mexc_spot_data,
     get_gateio_futures_data, get_mexc_futures_data, get_okx_futures_data, get_okx_spot_data, get_spot_prices_bingx,
     get_futures_prices_with_real_price_bingx, get_spot_prices_bitget, get_futures_data_bitget, get_spot_prices_bybit,
-    get_futures_data_bybit, get_binance_spot_data, get_binance_futures_data, get_htx_spot_data, get_xt_futures_data, get_xt_spot_data
+    get_futures_data_bybit, get_binance_spot_data, get_binance_futures_data, get_htx_spot_data, get_xt_futures_data, get_xt_spot_data,
+    get_phemex_spot_data, get_phemex_futures_data, get_aster_spot_data, get_aster_futures_data
 )
 from readFile import create_string_array_from_file, get_all_listed_symbols, is_listing_match, parse_listings_file_to_array
 from scan import scan_arbitrage_opportunities_test, should_send, check_close_opportunities
 from bitgetDelisting import is_bitget_delisting, refresh_bitget_delisting
+from fundingBot import FundingForecaster, scan_funding_opportunities, should_send_funding, format_funding_message
 
 TOKEN = "8023381531:AAGEyeO3xwoJHOSGbNsuTYrn72FUw94fwOE" # "7663512411:AAFOFh0uVn2_Kmmlr61i0gZuK0fJWHzxY80" # "7380819602:AAEdSde1Ub3uF-dxnKBfBWyOaJwBg-DCD3Y"
 CHANNEL_ID = "-1003192536711" # "-1002467194406" # "-1002332428135"
@@ -39,6 +41,9 @@ CHANNEL_ID_FUTURES_STOT = "-1004415544476"
 LISTING_ID_SENA = "-1003657279769"
 CHANNEL_ID_MAX_SENA = "-1004437250336"
 CHANNEL_ID_SENA = "-1003929442314"
+
+# Канал фандинг-бота (Bybit LONG / MEXC SHORT)
+CHANNEL_ID_FUNDING = "-1003876917788"
 
 
 bot = Bot(token=TOKEN)
@@ -247,6 +252,10 @@ async def send_arbitrage_opps():
                 "htx_fut": safe_fetch(get_htx_futures_data, "htx_fut"),
                 "coinex_spot": safe_fetch(get_coinex_spot_data, "coinex_spot"),
                 "coinex_fut": safe_fetch(get_coinex_futures_data, "coinex_fut"),
+                "phemex_spot": safe_fetch(get_phemex_spot_data, "phemex_spot"),
+                "phemex_fut": safe_fetch(get_phemex_futures_data, "phemex_fut"),
+                "aster_spot": safe_fetch(get_aster_spot_data, "aster_spot"),
+                "aster_fut": safe_fetch(get_aster_futures_data, "aster_fut"),
             }
 
             results = await asyncio.gather(*tasks.values())
@@ -268,6 +277,8 @@ async def send_arbitrage_opps():
                 data["xt_spot"],
                 # data["okx_spot"], data["okx_fut"],
                 data["coinex_spot"], data["coinex_fut"],
+                phemex_spot=data["phemex_spot"], phemex_fut=data["phemex_fut"],
+                aster_spot=data["aster_spot"], aster_fut=data["aster_fut"],
                 min_diff_percent=MIN_PROFIT,
                 min_usd_amount=MIN_VOLUME
             )
@@ -482,6 +493,40 @@ async def refresh_bitget_delisting_loop():
         await asyncio.sleep(600)
 
 
+# ================= ФАНДИНГ-БОТ =================
+funding_forecaster = FundingForecaster()
+
+
+async def funding_train_loop():
+    """Переобучение нейросети по истории фандинга (в отдельном потоке)."""
+    while True:
+        try:
+            await asyncio.to_thread(funding_forecaster.train)
+        except Exception as e:
+            print(f"Ошибка обучения фандинг-модели: {e}")
+        await asyncio.sleep(dataApp.FUNDING_RETRAIN_INTERVAL)
+
+
+async def funding_scan_loop():
+    """Поиск связок Bybit LONG / MEXC SHORT и отправка в канал фандинга."""
+    while True:
+        try:
+            opps = await asyncio.to_thread(scan_funding_opportunities, funding_forecaster, True)
+            for opp in opps:
+                if opp["symbol"] in black_list_symbols or opp["symbol"] in create_string_array_from_file():
+                    continue
+                if not should_send_funding(opp):
+                    continue
+                msg = format_funding_message(opp)
+                print(msg + "\n")
+                await bot.send_message(CHANNEL_ID_FUNDING, msg, parse_mode="HTML",
+                                       disable_web_page_preview=True)
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"Ошибка в funding_scan_loop: {e}")
+        await asyncio.sleep(dataApp.FUNDING_SCAN_INTERVAL)
+
+
 async def main():
     await set_commands(bot)
     await bot.delete_webhook(drop_pending_updates=True)
@@ -498,6 +543,8 @@ async def main():
     loop.create_task(refresh_bitget_delisting_loop())
     loop.create_task(send_arbitrage_opps())
     loop.create_task(send_closed_opps())
+    loop.create_task(funding_train_loop())
+    loop.create_task(funding_scan_loop())
 
     # Запускаем основной polling
     await dp.start_polling(bot)

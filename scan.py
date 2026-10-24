@@ -4,7 +4,8 @@ import time
 import dataApp
 from cup import get_coinex_order_book_futures, get_coinex_order_book_spot, get_okx_order_book_futures, get_okx_order_book_spot, get_order_book_binance_futures, get_order_book_binance_spot, get_order_book_htx, get_order_book_hyperliquid_futures, get_order_book_mexc_spot, get_order_book_gate_spot, get_order_book_bingx_spot, \
     get_order_book_bybit_spot, get_order_book_bitget_spot, get_order_book_mexc_futures, get_order_book_gate_futures, \
-    get_order_book_bingx_futures, get_order_book_bybit_futures, get_order_book_bitget_futures,  get_xt_order_book_spot # get_xt_order_book_futures,
+    get_order_book_bingx_futures, get_order_book_bybit_futures, get_order_book_bitget_futures,  get_xt_order_book_spot, \
+    get_order_book_phemex_spot, get_order_book_phemex_futures, get_order_book_aster_spot, get_order_book_aster_futures # get_xt_order_book_futures,
 
 
 import asyncio
@@ -48,16 +49,23 @@ def scan_arbitrage_opportunities_test(
     xt_spot, # xt_fut,
     # okx_spot, okx_fut,
     coinex_spot, coinex_fut,
+    phemex_spot=None, phemex_fut=None,
+    aster_spot=None, aster_fut=None,
     min_diff_percent=1.0,
     max_diff_percent=100.0,
     min_usd_amount=100
 ):
     opportunities = []
+    phemex_spot = phemex_spot or {}
+    phemex_fut = phemex_fut or {}
+    aster_spot = aster_spot or {}
+    aster_fut = aster_fut or {}
     all_symbols = set(mexc_spot.keys()) | set(mexc_futures.keys()) | set(gate_spot.keys()) | set(gate_futures.keys()) \
                   | set(bingx_spot.keys()) | set(bingx_futures.keys()) | set(bybit_spot.keys()) | set(bybit_futures.keys()) \
                   | set(bitget_spot.keys()) | set(bitget_futures.keys()) | set(binance_spot.keys()) | set(binance_fut.keys()) \
                   | set(hyperliquid_fut.keys()) \
-                  | set(htx_spot.keys()) | set(htx_fut.keys()) | set(xt_spot.keys())  | set(coinex_spot.keys()) | set(coinex_fut.keys()) # | set(xt_fut.keys()) | set(okx_spot.keys()) | set(okx_fut.keys())
+                  | set(htx_spot.keys()) | set(htx_fut.keys()) | set(xt_spot.keys())  | set(coinex_spot.keys()) | set(coinex_fut.keys()) \
+                  | set(phemex_spot.keys()) | set(phemex_fut.keys()) | set(aster_spot.keys()) | set(aster_fut.keys()) # | set(xt_fut.keys()) | set(okx_spot.keys()) | set(okx_fut.keys())
 
 
     exchanges = {
@@ -72,6 +80,8 @@ def scan_arbitrage_opportunities_test(
         # 'OKX': {'spot': okx_spot, 'futures': okx_fut},
         'HTX': {'spot': htx_spot, 'futures': htx_fut},
         'Coinex': {'spot': coinex_spot, 'futures': coinex_fut},
+        'Phemex': {'spot': phemex_spot, 'futures': phemex_fut},
+        'Aster': {'spot': aster_spot, 'futures': aster_fut},
     }
 
     def link(coin, type_, exchange):
@@ -99,6 +109,10 @@ def scan_arbitrage_opportunities_test(
             return f"https://www.okx.com/trade-spot/{coin.lower()}_usdt" if type_ == "spot" else f"https://www.okx.com/trade-swap/{coin.lower()}_usdt"
         elif exchange == "Coinex":
             return f"https://www.coinex.com/exchange/{coin_dash}" if type_ == "spot" else f"https://www.coinex.com/futures/linear/{coin_dash}"
+        elif exchange == "Phemex":
+            return f"https://phemex.com/spot/trade/{coin.upper()}USDT" if type_ == "spot" else f"https://phemex.com/futures/trade/{coin.upper()}USDT"
+        elif exchange == "Aster":
+            return f"https://www.asterdex.com/en/spot/{coin.upper()}USDT" if type_ == "spot" else f"https://www.asterdex.com/en/futures/v1/{coin.upper()}USDT"
 
     def is_valid_diff(diff):
         return min_diff_percent <= diff <= max_diff_percent
@@ -280,6 +294,10 @@ def check_close_opportunities(close_list):
             return f"https://www.okx.com/trade-spot/{coin.lower()}_usdt" if type_ == "spot" else f"https://www.okx.com/trade-swap/{coin.lower()}_usdt"
         elif exchange == "Coinex":
             return f"https://www.coinex.com/exchange/{coin_dash}" if type_ == "spot" else f"https://www.coinex.com/futures/linear/{coin_dash}"
+        elif exchange == "Phemex":
+            return f"https://phemex.com/spot/trade/{coin.upper()}USDT" if type_ == "spot" else f"https://phemex.com/futures/trade/{coin.upper()}USDT"
+        elif exchange == "Aster":
+            return f"https://www.asterdex.com/en/spot/{coin.upper()}USDT" if type_ == "spot" else f"https://www.asterdex.com/en/futures/v1/{coin.upper()}USDT"
 
     async def process_opp(key, old_opp):
         symbol = old_opp['symbol']
@@ -373,6 +391,10 @@ def getBayAndPriceSpot(symbol, exchange_name):
         return get_okx_order_book_spot(symbol)
     elif exchange_name == "Coinex":
         return get_coinex_order_book_spot(symbol)
+    elif exchange_name == "Phemex":
+        return get_order_book_phemex_spot(symbol)
+    elif exchange_name == "Aster":
+        return get_order_book_aster_spot(symbol)
 
 
 def getBayAndPriceFutures(symbol, exchange_name):
@@ -398,3 +420,7 @@ def getBayAndPriceFutures(symbol, exchange_name):
         return get_okx_order_book_futures(symbol)
     elif exchange_name == "Coinex":
         return get_coinex_order_book_futures(symbol)
+    elif exchange_name == "Phemex":
+        return get_order_book_phemex_futures(symbol)
+    elif exchange_name == "Aster":
+        return get_order_book_aster_futures(symbol)

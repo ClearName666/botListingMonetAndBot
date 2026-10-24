@@ -816,3 +816,136 @@ def get_coinex_futures_data() -> dict:
     except Exception as e:
         print(f"Ошибка при получении фьючерсных данных: {e}")
         return {}
+
+# ==================== PHEMEX ====================
+# Фьючерсы Phemex (USDT-M). Некоторые контракты называются с множителем
+# ("u1000PEPEUSDT"), поэтому храним соответствие BASE_USDT -> (сырой символ, множитель),
+# чтобы стакан запрашивался по правильному символу и цены делились на множитель.
+PHEMEX_FUT_SYMBOLS = {}
+ASTER_FUT_SYMBOLS = {}
+
+_MULTIPLIER_RE = re.compile(r'^u?(1000000|100000|10000|1000)([A-Z0-9]+)USDT$')
+
+
+def _split_multiplier(raw_symbol):
+    """'1000PEPEUSDT' / 'u1000PEPEUSDT' -> ('PEPE_USDT', 1000); 'BTCUSDT' -> ('BTC_USDT', 1)."""
+    m = _MULTIPLIER_RE.match(raw_symbol)
+    if m:
+        return m.group(2) + "_USDT", int(m.group(1))
+    if raw_symbol.endswith("USDT") and len(raw_symbol) > 4:
+        return raw_symbol[:-4] + "_USDT", 1
+    return None, None
+
+
+def get_phemex_futures_data():
+    url = "https://api.phemex.com/md/v2/ticker/24hr/all"
+    try:
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        print(f"Ошибка API {url}: {e}")
+        return {}
+
+    result = {}
+    for item in data.get("result", []) or []:
+        try:
+            raw_symbol = item.get("symbol", "")
+            clean_symbol, mult = _split_multiplier(raw_symbol)
+            if not clean_symbol:
+                continue
+            price = float(item.get("closeRp") or item.get("lastRp") or 0)
+            if price == 0:
+                continue
+            volume = float(item.get("turnoverRv", 0) or 0)
+            PHEMEX_FUT_SYMBOLS[clean_symbol] = (raw_symbol, mult)
+            result[clean_symbol] = {"price": price / mult, "volume": volume}
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+# Спот Phemex: цены там передаются в масштабированном виде (Ep), масштаб зависит
+# от пары, поэтому берём через ccxt — он сам загружает настройки пар и пересчитывает.
+_phemex_ccxt = None
+
+
+def _get_phemex_ccxt():
+    global _phemex_ccxt
+    if _phemex_ccxt is None:
+        ex = ccxt.phemex({'timeout': 15000})
+        ex.load_markets()
+        _phemex_ccxt = ex
+    return _phemex_ccxt
+
+
+def get_phemex_spot_data():
+    try:
+        ex = _get_phemex_ccxt()
+        tickers = ex.fetch_tickers(params={'type': 'spot'})
+        result = {}
+        for symbol, t in tickers.items():
+            if not symbol.endswith('/USDT') or ':' in symbol:
+                continue
+            price = t.get('last')
+            if price:
+                result[symbol.replace('/', '_')] = float(price)
+        return result
+    except Exception as e:
+        print(f"❌ Ошибка при получении спот-данных Phemex: {e}")
+        return {}
+
+
+# ==================== ASTER ====================
+# API Aster повторяет API Binance (fapi / sapi).
+
+def get_aster_futures_data():
+    url = "https://fapi.asterdex.com/fapi/v1/ticker/24hr"
+    try:
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        print(f"Ошибка API {url}: {e}")
+        return {}
+
+    result = {}
+    for item in data if isinstance(data, list) else []:
+        try:
+            raw_symbol = item.get("symbol", "")
+            clean_symbol, mult = _split_multiplier(raw_symbol)
+            if not clean_symbol:
+                continue
+            price = float(item.get("lastPrice", 0) or 0)
+            if price == 0:
+                continue
+            volume = float(item.get("quoteVolume", 0) or 0)
+            ASTER_FUT_SYMBOLS[clean_symbol] = (raw_symbol, mult)
+            result[clean_symbol] = {"price": price / mult, "volume": volume}
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def get_aster_spot_data():
+    url = "https://sapi.asterdex.com/api/v1/ticker/price"
+    try:
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        print(f"Ошибка API {url}: {e}")
+        return {}
+
+    result = {}
+    for item in data if isinstance(data, list) else []:
+        try:
+            symbol = item.get("symbol", "")
+            if not symbol.endswith("USDT") or len(symbol) <= 4:
+                continue
+            price = float(item.get("price", 0) or 0)
+            if price != 0:
+                result[symbol[:-4] + "_USDT"] = price
+        except (TypeError, ValueError):
+            continue
+    return result
