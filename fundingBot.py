@@ -568,6 +568,11 @@ def scan_funding_opportunities(forecaster, verbose=False):
             continue
         hist_streak = streak_hours(series, threshold)
         if hist_streak < dataApp.FUNDING_MIN_HISTORY_HOURS:
+            if verbose:
+                recent = ", ".join(f"{r[1]:+.3f}" for r in series[-24::4]) if series else "нет данных"
+                print(f"[funding]   {sym}: дельта сейчас {delta:.3f}%, цена {price_diff:.3f}% — "
+                      f"по истории держится {hist_streak} ч (нужно {dataApp.FUNDING_MIN_HISTORY_HOURS}); "
+                      f"дельта за последние сутки (каждые 4ч): {recent}")
             continue
         stats["history"] += 1
 
@@ -576,6 +581,10 @@ def scan_funding_opportunities(forecaster, verbose=False):
         deltas = [r[1] for r in last_run] + [delta]
         proba, long_enough, method = forecaster.predict(deltas, b_norm, m_norm, b_int, hist_streak)
         if not long_enough:
+            if verbose:
+                p_txt = f"{proba * 100:.0f}%" if proba is not None else method
+                print(f"[funding]   {sym}: дельта {delta:.3f}%, история {hist_streak} ч — "
+                      f"прогноз не прошёл ({p_txt})")
             continue
         stats["forecast"] += 1
 

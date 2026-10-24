@@ -11,6 +11,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton, Message, BotCommand, InlineKeyboardMarkup
 from aiogram import types
+from aiogram.exceptions import TelegramRetryAfter
 
 from cup import cache_clear
 import dataApp
@@ -65,6 +66,18 @@ black_list_symbols = set()
 # Объявление bot, channel_id и pending_opp_list должно быть ДО этой функции
 # Но так как они уже объявлены в вашем файле, просто вставьте эту функцию
 # где-нибудь вверху, например, сразу после импортов.
+
+async def tg_send(chat_id, text, **kwargs):
+    """Отправка в Telegram с ожиданием при флуд-контроле.
+    Без этого одна ошибка 'Flood control exceeded' обрывала отправку всей пачки сделок."""
+    for attempt in range(3):
+        try:
+            return await bot.send_message(chat_id, text, **kwargs)
+        except TelegramRetryAfter as e:
+            print(f"Telegram флуд-контроль в {chat_id}: жду {e.retry_after} сек")
+            await asyncio.sleep(e.retry_after + 1)
+    print(f"Сообщение в {chat_id} не отправлено после 3 попыток")
+
 
 def format_opportunity_message(opp):
     """Форматирует сообщение об арбитражной возможности."""
@@ -137,31 +150,31 @@ async def send_telegram_opportunity(opp):
         
 
         if opp['buy_type'].lower() == "futures" and opp['sell_type'].lower() == "spot":
-            await bot.send_message(CHANNEL_ID_FUTURES_STOT, msg, parse_mode="HTML")
+            await tg_send(CHANNEL_ID_FUTURES_STOT, msg, parse_mode="HTML")
             await asyncio.sleep(0.5) # Небольшая задержка перед следующими отправками
         else:
             # Отправка в основной канал
-            await bot.send_message(CHANNEL_ID, msg, parse_mode="HTML", disable_web_page_preview=True,
+            await tg_send(CHANNEL_ID, msg, parse_mode="HTML", disable_web_page_preview=True,
                                 reply_markup=reply_markup)
             await asyncio.sleep(0.5) # Небольшая задержка перед следующими отправками
 
-            await bot.send_message(CHANNEL_ID_SENA, msg, parse_mode="HTML")
+            await tg_send(CHANNEL_ID_SENA, msg, parse_mode="HTML")
             await asyncio.sleep(0.5) # Небольшая задержка перед следующими отправками
             
 
             # Отправка в канал MAX
             if opp['profit_percent'] >= dataApp.MIN_PROFIT_MAX:
-                await bot.send_message(CHANNEL_ID_MAX, msg, parse_mode="HTML", disable_web_page_preview=True,
+                await tg_send(CHANNEL_ID_MAX, msg, parse_mode="HTML", disable_web_page_preview=True,
                                     reply_markup=reply_markup)
                 await asyncio.sleep(0.5)
                 
-                await bot.send_message(CHANNEL_ID_MAX_SENA, msg, parse_mode="HTML")
+                await tg_send(CHANNEL_ID_MAX_SENA, msg, parse_mode="HTML")
                 await asyncio.sleep(0.5)
 
             # Отправка в канал ЛИСТИНГОВ (по файлу)
             parsed_listings = parse_listings_file_to_array()
             if is_listing_match(opp, parsed_listings):
-                await bot.send_message(
+                await tg_send(
                     LISTING_ID,
                     msg,
                     parse_mode="HTML",
@@ -170,7 +183,7 @@ async def send_telegram_opportunity(opp):
                 )
                 await asyncio.sleep(0.5)
                 
-                await bot.send_message(
+                await tg_send(
                     LISTING_ID_SENA,
                     msg,
                     parse_mode="HTML"
@@ -180,7 +193,7 @@ async def send_telegram_opportunity(opp):
             # Отправка в канал ЛИСТИНГОВ (по символу)
             all_listed_symbols = get_all_listed_symbols()
             if opp['symbol'] in all_listed_symbols:
-                await bot.send_message(
+                await tg_send(
                     LISTING_MONET_ID,
                     msg,
                     parse_mode="HTML",
@@ -189,7 +202,7 @@ async def send_telegram_opportunity(opp):
                 )
                 await asyncio.sleep(0.5)
 
-                await bot.send_message(
+                await tg_send(
                     LISTING_ID_SENA,
                     msg,
                     parse_mode="HTML"
@@ -203,7 +216,7 @@ async def send_telegram_opportunity(opp):
 # --- Конец вставки в main.py ---
 
 async def send_message(id_channel, msg):
-    await bot.send_message(id_channel, msg, parse_mode="HTML", disable_web_page_preview=True)
+    await tg_send(id_channel, msg, parse_mode="HTML", disable_web_page_preview=True)
 
 async def safe_fetch(func, name):
     try:
@@ -308,21 +321,21 @@ async def process_callback_unclose(callback_query: types.CallbackQuery):
     if symbol in close_list:
         opp = close_list.pop(symbol)
         pending_opp_list[symbol] = opp
-        await bot.send_message(
+        await tg_send(
             CHANNEL_ID_CLOSE,
             "Удалён из закрытия.",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
     elif symbol in pending_opp_list:
-        await bot.send_message(
+        await tg_send(
             CHANNEL_ID_CLOSE,
             f"{symbol} уже не находится в закрытии.",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
     else:
-        await bot.send_message(
+        await tg_send(
             CHANNEL_ID_CLOSE,
             "Информация устарела или недоступна.",
             parse_mode="HTML",
@@ -340,21 +353,21 @@ async def process_callback_details(callback_query: types.CallbackQuery):
     if symbol in pending_opp_list:
         opp = pending_opp_list.pop(symbol)
         close_list[symbol] = opp
-        await bot.send_message(
+        await tg_send(
             CHANNEL_ID,
             "Добавлен в закрытие.",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
     elif symbol in close_list:
-        await bot.send_message(
+        await tg_send(
             CHANNEL_ID,
             f"{symbol} уже добавлен.",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
     else:
-        await bot.send_message(
+        await tg_send(
             CHANNEL_ID,
             "Информация устарела или недоступна.",
             parse_mode="HTML",
@@ -381,7 +394,7 @@ async def send_closed_opps():
                         f"💰 Объём: {opp['volume']}\n"
                         f"📈 Прибыль: <b>{opp['profit_percent']:.2f}%</b>"
                     )
-                    # await bot.send_message(CHANNEL_ID_CLOSE, msg, parse_mode="HTML", disable_web_page_preview=True)
+                    # await tg_send(CHANNEL_ID_CLOSE, msg, parse_mode="HTML", disable_web_page_preview=True)
                     # новый код
                     # Создание клавиатуры с кнопкой "Удалить из закрытия"
                     symbol_data = f"{opp['symbol']} ({opp['buy_type'].upper()} на {opp['buy_exchange']}) ({opp['sell_type'].upper()} на {opp['sell_exchange']})"
@@ -396,7 +409,7 @@ async def send_closed_opps():
                         ]
                     )
 
-                    await bot.send_message(
+                    await tg_send(
                         CHANNEL_ID_CLOSE,
                         msg,
                         reply_markup=keyboard,
@@ -424,7 +437,7 @@ async def send_closed_opps():
 #                 f"💰 Объём: {opp['volume']}\n"
 #                 f"📈 Прибыль: <b>{opp['profit_percent']:.2f}%</b>"
 #             )
-#             await bot.send_message(CHANNEL_ID_CLOSE, msg, parse_mode="HTML",
+#             await tg_send(CHANNEL_ID_CLOSE, msg, parse_mode="HTML",
 #                                    disable_web_page_preview=True)
 #         await asyncio.sleep(1)  # Проверять каждые 1 секунду
 
@@ -526,7 +539,7 @@ async def funding_scan_loop():
                     continue
                 msg = format_funding_message(opp)
                 print(msg + "\n")
-                await bot.send_message(CHANNEL_ID_FUNDING, msg, parse_mode="HTML",
+                await tg_send(CHANNEL_ID_FUNDING, msg, parse_mode="HTML",
                                        disable_web_page_preview=True)
                 await asyncio.sleep(0.5)
         except Exception as e:

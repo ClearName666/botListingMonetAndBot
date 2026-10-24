@@ -2144,6 +2144,9 @@ def get_order_book_aster_spot(symbol="BTC_USDT"):
         response = requests.get("https://sapi.asterdex.com/api/v1/depth",
                                 params={"symbol": clean_symbol, "limit": LIMIT_ORDER_BOOK}, timeout=10)
         data = response.json()
+        if not isinstance(data, dict):
+            print(f"Aster spot {clean_symbol}: неожиданный ответ стакана: {str(data)[:200]}")
+            return _book_fail("Aster", "spot", clean_symbol)
         bids = [[float(p[0]), float(p[1])] for p in data.get("bids", [])]
         asks = [[float(p[0]), float(p[1])] for p in data.get("asks", [])]
         if not bids or not asks:
