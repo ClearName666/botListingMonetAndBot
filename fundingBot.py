@@ -1,12 +1,17 @@
-# Фандинг-бот: связка Bybit LONG / MEXC SHORT.
+# Фандинг-бот «Снайпер»: связка Bybit LONG / MEXC SHORT.
 #
-# Условия сигнала (все должны выполниться):
-#   1. Дельта фандинга >= FUNDING_MIN_DELTA (по умолчанию 0.2%).
-#   2. Разница цен ((цена Bybit − цена MEXC) / цена MEXC * 100) <= этой дельты.
-#      Берём реальные цены входа: ask на Bybit (покупаем) и bid на MEXC (продаём).
-#   3. По истории фандинга дельта держалась выше порога не меньше FUNDING_MIN_HISTORY_HOURS.
-#   4. Нейросеть прогнозирует, что дельта продержится ещё FUNDING_FORECAST_HOURS часов
-#      (вероятность >= FUNDING_MIN_PROBA).
+# Доход связки по фандингу = фандинг MEXC − фандинг Bybit, приведённый к «% в день».
+# (Лонг на Bybit получает, когда фандинг там отрицательный; шорт на MEXC — когда положительный.
+#  Если фандинг «перевернулся» и на MEXC стал больше, чем на Bybit, доход уходит в минус.)
+#
+# Сигнал, если выполнены все условия:
+#   1. Доход сейчас >= FUNDING_MIN_DELTA (0.5% в день).
+#   2. Вход по цене не хуже −FUNDING_MAX_ENTRY_LOSS (1%):
+#      (ask Bybit − bid MEXC) / bid MEXC * 100 <= 1.
+#   3. Суточный доход уже держится >= порога не меньше FUNDING_MIN_HISTORY_HOURS.
+#   4. Нейросеть прогнозирует, что доход >= 0.5% в день продержится дольше
+#      FUNDING_FORECAST_HOURS (3 дня) без долгого переворота. Она учитывает, сколько
+#      раньше длились такие периоды по этой монете.
 #
 # Запуск отдельно для проверки (без Телеграма):  python fundingBot.py
 
@@ -178,27 +183,51 @@ def _cached_hist(key, loader):
     return val
 
 
+def _enough_history(rows):
+    if len(rows) < 2:
+        return False
+    span = max(r[0] for r in rows) - min(r[0] for r in rows)
+    return span >= dataApp.FUNDING_HISTORY_DAYS * 24 * HOUR_MS
+
+
 def fetch_bybit_history(raw_symbol):
-    """[(ts_ms, rate%)] по возрастанию времени (до 200 последних начислений)."""
+    """[(ts_ms, rate%)] по возрастанию времени, примерно за FUNDING_HISTORY_DAYS дней."""
     def load():
-        data = _get(f"{BYBIT_API}/v5/market/funding/history",
-                    {"category": "linear", "symbol": raw_symbol, "limit": 200})
-        rows = (data.get("result") or {}).get("list", []) or []
-        out = [(int(r["fundingRateTimestamp"]), float(r["fundingRate"]) * 100)
-               for r in rows if r.get("fundingRateTimestamp") and r.get("fundingRate") not in (None, "")]
-        return sorted(out)
+        out, end = {}, None
+        for _ in range(6):
+            params = {"category": "linear", "symbol": raw_symbol, "limit": 200}
+            if end:
+                params["endTime"] = end
+            data = _get(f"{BYBIT_API}/v5/market/funding/history", params)
+            rows = (data.get("result") or {}).get("list", []) or []
+            page = [(int(r["fundingRateTimestamp"]), float(r["fundingRate"]) * 100)
+                    for r in rows if r.get("fundingRateTimestamp") and r.get("fundingRate") not in (None, "")]
+            if not page:
+                break
+            out.update(page)
+            if len(rows) < 200 or _enough_history(list(out.items())):
+                break
+            end = min(ts for ts, _ in page) - 1
+        return sorted(out.items())
     return _cached_hist(("bybit", raw_symbol), load)
 
 
 def fetch_mexc_history(symbol):
-    """[(ts_ms, rate%)] по возрастанию времени (до 100 последних начислений)."""
+    """[(ts_ms, rate%)] по возрастанию времени, примерно за FUNDING_HISTORY_DAYS дней."""
     def load():
-        data = _get(f"{MEXC_API}/api/v1/contract/funding_rate/history",
-                    {"symbol": symbol, "page_num": 1, "page_size": 100})
-        rows = (data.get("data") or {}).get("resultList", []) or []
-        out = [(int(r["settleTime"]), float(r["fundingRate"]) * 100)
-               for r in rows if r.get("settleTime") and r.get("fundingRate") is not None]
-        return sorted(out)
+        out = {}
+        for page_num in range(1, 9):
+            data = _get(f"{MEXC_API}/api/v1/contract/funding_rate/history",
+                        {"symbol": symbol, "page_num": page_num, "page_size": 100})
+            rows = (data.get("data") or {}).get("resultList", []) or []
+            page = [(int(r["settleTime"]), float(r["fundingRate"]) * 100)
+                    for r in rows if r.get("settleTime") and r.get("fundingRate") is not None]
+            if not page:
+                break
+            out.update(page)
+            if len(rows) < 100 or _enough_history(list(out.items())):
+                break
+        return sorted(out.items())
     return _cached_hist(("mexc", symbol), load)
 
 
@@ -227,7 +256,7 @@ def hourly_rates(history):
 
 
 def calc_delta(bybit_pct, mexc_pct, mode=None):
-    """Дельта фандинга для связки LONG Bybit / SHORT MEXC (в %)."""
+    """Доход связки LONG Bybit / SHORT MEXC по фандингу (в %)."""
     mode = mode or dataApp.FUNDING_DELTA_MODE
     if mode == "abs":
         return abs(bybit_pct) - abs(mexc_pct)
@@ -235,13 +264,13 @@ def calc_delta(bybit_pct, mexc_pct, mode=None):
 
 
 def _norm_hours():
-    return dataApp.FUNDING_NORMALIZE_HOURS or 8
+    return dataApp.FUNDING_NORMALIZE_HOURS or 24
 
 
 def delta_series(bybit_hist, mexc_hist):
     """
-    Почасовой ряд дельты (приведённой к FUNDING_NORMALIZE_HOURS).
-    Возвращает список (час, дельта%, bybit%, mexc%) по возрастанию; разрывы сохраняются.
+    Почасовой ряд дохода связки (в % за FUNDING_NORMALIZE_HOURS, по умолчанию — в день).
+    Возвращает список (час, доход%, bybit%, mexc%) по возрастанию; разрывы сохраняются.
     """
     hb, hm = hourly_rates(bybit_hist), hourly_rates(mexc_hist)
     n = _norm_hours()
@@ -250,65 +279,6 @@ def delta_series(bybit_hist, mexc_hist):
         b, m = hb[h] * n, hm[h] * n
         series.append((h, calc_delta(b, m), b, m))
     return series
-
-
-def streak_hours(series, threshold):
-    """Сколько последних часов подряд (без разрывов) дельта была >= порога."""
-    count, prev_h = 0, None
-    for h, d, _, _ in reversed(series):
-        if prev_h is not None and prev_h - h != 1:
-            break
-        if d < threshold:
-            break
-        count += 1
-        prev_h = h
-    return count
-
-
-# ============================ НЕЙРОСЕТЬ ============================
-
-FEATURE_NAMES = [
-    "delta_now", "mean_8h", "mean_24h", "mean_72h", "std_24h",
-    "change_8h", "change_24h", "log_streak", "share_above_72h",
-    "bybit_now", "mexc_now", "bybit_interval",
-]
-
-
-def _mean(xs):
-    return sum(xs) / len(xs) if xs else 0.0
-
-
-def _std(xs):
-    if len(xs) < 2:
-        return 0.0
-    m = _mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
-
-
-def make_features(deltas, bybit_now, mexc_now, bybit_interval, threshold):
-    """deltas — почасовая дельта, последний элемент = текущий момент."""
-    d = deltas
-    cur = d[-1]
-    streak = 0
-    for x in reversed(d):
-        if x < threshold:
-            break
-        streak += 1
-    last72 = d[-72:]
-    return [
-        cur,
-        _mean(d[-8:]),
-        _mean(d[-24:]),
-        _mean(last72),
-        _std(d[-24:]),
-        cur - d[-9] if len(d) >= 9 else 0.0,
-        cur - d[-25] if len(d) >= 25 else 0.0,
-        math.log1p(streak),
-        sum(1 for x in last72 if x >= threshold) / len(last72),
-        bybit_now,
-        mexc_now,
-        float(bybit_interval),
-    ]
 
 
 def _contiguous_runs(series):
@@ -324,24 +294,148 @@ def _contiguous_runs(series):
     return runs
 
 
-def build_samples(series, bybit_interval, threshold, horizon, step=2):
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _std(xs):
+    if len(xs) < 2:
+        return 0.0
+    m = _mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+# ===================== ЭПИЗОДЫ: сколько раньше держался доход =====================
+#
+# «Эпизод» — период, когда связка приносила >= порога В ДЕНЬ. Смотрим на средний доход
+# за последние 24 часа, а не на каждое начисление отдельно: так одно слабое начисление
+# не рвёт период, а переворот фандинга (MEXC стал больше Bybit) — рвёт.
+
+ROLL_HOURS = 24
+
+
+class EpisodeTracker:
+    """Идёт по почасовому ряду дохода и считает эпизоды и признаки для нейросети."""
+
+    def __init__(self, threshold, horizon):
+        self.thr = threshold
+        self.horizon = horizon
+        self.d = []            # доход по часам
+        self.b = []
+        self.m = []
+        self.csum = [0.0]      # префиксные суммы для скользящего среднего
+        self.streak = 0        # текущая серия часов с суточным доходом >= порога
+        self.episodes = []     # длины завершённых эпизодов (ч)
+        self.hours_above = 0
+
+    def push(self, delta, b, m):
+        self.d.append(delta)
+        self.b.append(b)
+        self.m.append(m)
+        self.csum.append(self.csum[-1] + delta)
+        if self.rolling() >= self.thr:
+            self.streak += 1
+            self.hours_above += 1
+        else:
+            if self.streak:
+                self.episodes.append(self.streak)
+            self.streak = 0
+
+    def rolling(self, hours=ROLL_HOURS):
+        n = min(hours, len(self.d))
+        return (self.csum[-1] - self.csum[-1 - n]) / n if n else 0.0
+
+    def summary(self):
+        """Человекочитаемая сводка по прошлым эпизодам."""
+        eps = self.episodes
+        return {
+            "count": len(eps),
+            "avg": _mean(eps),
+            "max": max(eps) if eps else 0,
+            "long": sum(1 for e in eps if e >= self.horizon),
+            "hours": len(self.d),
+        }
+
+    def features(self, interval):
+        d = self.d
+        cur = d[-1]
+        eps = self.episodes
+        last168 = d[-168:]
+        return [
+            cur,
+            _mean(d[-8:]),
+            self.rolling(24),
+            self.rolling(72),
+            _std(d[-24:]),
+            cur - d[-25] if len(d) >= 25 else 0.0,
+            math.log1p(self.streak),
+            math.log1p(len(eps)),
+            math.log1p(_mean(eps)),
+            math.log1p(max(eps) if eps else 0),
+            (sum(1 for e in eps if e >= self.horizon) / len(eps)) if eps else 0.0,
+            sum(1 for x in last168 if x < 0) / len(last168),
+            self.hours_above / len(d),
+            math.log1p(len(d)),
+            self.b[-1],
+            self.m[-1],
+            float(interval),
+        ]
+
+
+FEATURE_NAMES = [
+    "income_now", "mean_8h", "income_24h", "income_72h", "std_24h", "change_24h",
+    "log_streak", "log_n_episodes", "log_avg_episode", "log_max_episode",
+    "share_long_episodes", "flip_share_7d", "share_hours_above", "log_history",
+    "bybit_now", "mexc_now", "bybit_interval",
+]
+
+
+def track(deltas, b_vals, m_vals, threshold=None, horizon=None):
+    tr = EpisodeTracker(threshold if threshold is not None else dataApp.FUNDING_MIN_DELTA,
+                        horizon or dataApp.FUNDING_FORECAST_HOURS)
+    for d, b, m in zip(deltas, b_vals, m_vals):
+        tr.push(d, b, m)
+    return tr
+
+
+def future_label(future, threshold, max_flip_hours):
+    """1 — следующие часы связка приносила в среднем >= порога и почти не переворачивалась."""
+    if not future:
+        return 0
+    flips = sum(1 for x in future if x < 0)
+    return 1 if _mean(future) >= threshold and flips <= max_flip_hours else 0
+
+
+def build_samples(series, bybit_interval, threshold, horizon, step=4):
     """
     Обучающие примеры из одного ряда.
-    Берём моменты, где дельта уже заметная (>= половины порога), и смотрим,
-    продержалась ли средняя дельта >= порога следующие `horizon` часов.
+    Берём моменты, где доход уже заметный (>= половины порога), и смотрим,
+    продержался ли он следующие `horizon` часов (в среднем >= порога, без долгого переворота).
     """
     X, y = [], []
     min_hist = 24
+    max_flip = dataApp.FUNDING_MAX_FLIP_HOURS
     for run in _contiguous_runs(series):
+        if len(run) < min_hist + horizon + 1:
+            continue
         deltas = [r[1] for r in run]
-        for t in range(min_hist, len(run) - horizon, step):
+        tr = EpisodeTracker(threshold, horizon)
+        for t, row in enumerate(run):
+            tr.push(row[1], row[2], row[3])
+            if t < min_hist or t + horizon >= len(run) or t % step:
+                continue
             if deltas[t] < threshold * 0.5:
                 continue
-            feats = make_features(deltas[:t + 1], run[t][2], run[t][3], bybit_interval, threshold)
-            future = deltas[t + 1:t + 1 + horizon]
-            X.append(feats)
-            y.append(1 if _mean(future) >= threshold else 0)
+            X.append(tr.features(bybit_interval))
+            y.append(future_label(deltas[t + 1:t + 1 + horizon], threshold, max_flip))
     return X, y
+
+
+def _model_config():
+    """Настройки, от которых зависит смысл модели: при их изменении модель обучается заново."""
+    return {"threshold": dataApp.FUNDING_MIN_DELTA, "horizon": dataApp.FUNDING_FORECAST_HOURS,
+            "flip": dataApp.FUNDING_MAX_FLIP_HOURS, "norm": _norm_hours(),
+            "mode": dataApp.FUNDING_DELTA_MODE}
 
 
 class FundingForecaster:
@@ -362,7 +456,7 @@ class FundingForecaster:
             import joblib
             if os.path.exists(MODEL_FILE):
                 bundle = joblib.load(MODEL_FILE)
-                if bundle.get("features") == FEATURE_NAMES:
+                if bundle.get("features") == FEATURE_NAMES and bundle.get("config") == _model_config():
                     self.model = bundle["model"]
                     self.trained_at = bundle.get("trained_at")
                     self.info = bundle.get("info", "загружена с диска")
@@ -460,41 +554,40 @@ class FundingForecaster:
                     pred = m.predict_proba([X[i] for i in te])[:, 1] >= dataApp.FUNDING_MIN_PROBA
                     hit = sum(1 for p, t in zip(pred, y_te) if p and t)
                     fired = int(sum(pred))
-                    acc_text = (f"; проверка на других монетах: нашла {hit} из {sum(y_te)} держащихся, "
+                    acc_text = (f"; проверка на других монетах: нашла {hit} из {sum(y_te)} долгих периодов, "
                                 f"верных сигналов {hit} из {fired}")
         except Exception as e:
             print(f"[funding] проверка модели не удалась: {e}")
 
         model = new_model().fit(*balanced(X, y))
         info = (f"обучена {time.strftime('%Y-%m-%d %H:%M')} на {len(y)} примерах "
-                f"({pos} держались / {neg} нет){acc_text}")
+                f"({pos} держались > {horizon // 24} дн. / {neg} нет){acc_text}")
         with self._lock:
             self.model = model
             self.trained_at = time.time()
             self.info = info
         try:
-            joblib.dump({"model": model, "features": FEATURE_NAMES,
+            joblib.dump({"model": model, "features": FEATURE_NAMES, "config": _model_config(),
                          "trained_at": self.trained_at, "info": info}, MODEL_FILE)
         except Exception as e:
             print(f"[funding] не удалось сохранить модель: {e}")
         print(f"[funding] Нейросеть {info}")
         return True
 
-    def predict(self, deltas, bybit_now, mexc_now, bybit_interval, history_streak):
+    def predict(self, tracker, bybit_interval):
         """
+        tracker — EpisodeTracker, прошедший всю историю + текущий момент.
         Возвращает (вероятность или None, продержится_долго: bool, метод: str).
         """
         with self._lock:
             model = self.model
-        if model is not None and deltas:
+        if model is not None and tracker.d:
             try:
-                feats = make_features(deltas, bybit_now, mexc_now, bybit_interval,
-                                      dataApp.FUNDING_MIN_DELTA)
-                proba = float(model.predict_proba([feats])[0][1])
+                proba = float(model.predict_proba([tracker.features(bybit_interval)])[0][1])
                 return proba, proba >= dataApp.FUNDING_MIN_PROBA, "нейросеть"
             except Exception as e:
                 print(f"[funding] ошибка прогноза: {e}")
-        ok = history_streak >= dataApp.FUNDING_FALLBACK_HOURS
+        ok = tracker.streak >= dataApp.FUNDING_FALLBACK_HOURS
         return None, ok, "эвристика (нейросеть ещё не обучена)"
 
 
@@ -549,14 +642,15 @@ def scan_funding_opportunities(forecaster, verbose=False):
         m_norm = m_rate * (norm / m_int) if norm else m_rate
         delta = calc_delta(b_norm, m_norm)
 
-        # 1. дельта фандинга
+        # 1. доход по фандингу сейчас (% в день)
         if delta < threshold:
             continue
         stats["delta"] += 1
 
-        # 2. разница цен: покупаем на Bybit по ask, продаём на MEXC по bid
+        # 2. разница цен: покупаем на Bybit по ask, продаём на MEXC по bid.
+        #    Можно зайти в минус до FUNDING_MAX_ENTRY_LOSS — отобьётся фандингом за несколько дней.
         price_diff = (b["ask"] - m["bid"]) / m["bid"] * 100
-        if price_diff > delta:
+        if price_diff > dataApp.FUNDING_MAX_ENTRY_LOSS:
             continue
         stats["price"] += 1
 
@@ -566,24 +660,27 @@ def scan_funding_opportunities(forecaster, verbose=False):
         except Exception as e:
             print(f"[funding] история {sym}: {e}")
             continue
-        hist_streak = streak_hours(series, threshold)
+        last_run = _contiguous_runs(series)[-1] if series else []
+        tracker = track([r[1] for r in last_run], [r[2] for r in last_run], [r[3] for r in last_run])
+        hist_streak = tracker.streak          # по завершённым начислениям
+        past = tracker.summary()
         if hist_streak < dataApp.FUNDING_MIN_HISTORY_HOURS:
             if verbose:
-                recent = ", ".join(f"{r[1]:+.3f}" for r in series[-24::4]) if series else "нет данных"
-                print(f"[funding]   {sym}: дельта сейчас {delta:.3f}%, цена {price_diff:.3f}% — "
+                recent = ", ".join(f"{r[1]:+.2f}" for r in series[-24::4]) if series else "нет данных"
+                print(f"[funding]   {sym}: доход сейчас {delta:.2f}%/день, вход {price_diff:+.2f}% — "
                       f"по истории держится {hist_streak} ч (нужно {dataApp.FUNDING_MIN_HISTORY_HOURS}); "
-                      f"дельта за последние сутки (каждые 4ч): {recent}")
+                      f"доход за сутки (каждые 4ч): {recent}")
             continue
         stats["history"] += 1
 
-        # 4. прогноз нейросети (последний элемент — текущая дельта)
-        last_run = _contiguous_runs(series)[-1] if series else []
-        deltas = [r[1] for r in last_run] + [delta]
-        proba, long_enough, method = forecaster.predict(deltas, b_norm, m_norm, b_int, hist_streak)
+        # 4. прогноз нейросети: продержится ли доход >= порога дольше горизонта
+        tracker.push(delta, b_norm, m_norm)   # текущий момент
+        proba, long_enough, method = forecaster.predict(tracker, b_int)
         if not long_enough:
             if verbose:
                 p_txt = f"{proba * 100:.0f}%" if proba is not None else method
-                print(f"[funding]   {sym}: дельта {delta:.3f}%, история {hist_streak} ч — "
+                print(f"[funding]   {sym}: доход {delta:.2f}%/день, держится {hist_streak} ч, "
+                      f"раньше периодов {past['count']} (ср. {past['avg']:.0f} ч, макс {past['max']} ч) — "
                       f"прогноз не прошёл ({p_txt})")
             continue
         stats["forecast"] += 1
@@ -597,15 +694,16 @@ def scan_funding_opportunities(forecaster, verbose=False):
             "bybit_norm": b_norm, "mexc_norm": m_norm,
             "bybit_next": b["next_ts"], "mexc_next": m_info["next_ts"],
             "delta": delta, "price_diff": price_diff,
-            "history_hours": hist_streak,
+            "history_hours": hist_streak, "past": past,
             "proba": proba, "method": method,
             "bybit_link": bybit_link, "mexc_link": mexc_link,
         })
 
     if verbose:
-        print(f"[funding] кандидатов {stats['candidates']}, прошли дельту {stats['delta']}, "
+        print(f"[funding] кандидатов {stats['candidates']}, прошли доход {stats['delta']}, "
               f"цену {stats['price']}, историю {stats['history']}, прогноз {stats['forecast']}")
-    opps.sort(key=lambda o: -(o["delta"] - max(o["price_diff"], 0)))
+    # выше — те, что быстрее отбивают вход и больше приносят
+    opps.sort(key=lambda o: -(o["delta"] * dataApp.FUNDING_FORECAST_HOURS / 24 - max(o["price_diff"], 0)))
     return opps
 
 
@@ -638,32 +736,57 @@ def _until(ts_ms):
     return f", начисление через {left // 3600}ч {left % 3600 // 60}м"
 
 
+def _per_label():
+    n = _norm_hours()
+    return "в день" if n == 24 else f"за {n}ч"
+
+
+def _hours_text(h):
+    h = int(round(h))
+    if h >= 48:
+        return f"{h / 24:.1f} дн."
+    return f"{h} ч"
+
+
 def format_funding_message(opp):
-    norm = dataApp.FUNDING_NORMALIZE_HOURS
-    per = f" за {norm}ч" if norm else ""
+    per = _per_label()
+    days = dataApp.FUNDING_FORECAST_HOURS / 24
 
     def rate_line(rate, interval, rate_norm):
-        s = f"{rate:+.4f}% / {interval}ч"
-        if norm and interval != norm:
-            s += f" (≈ {rate_norm:+.4f}%{per})"
-        return s
+        return f"{rate:+.4f}% / {interval}ч (≈ {rate_norm:+.3f}% {per})"
 
     if opp["proba"] is not None:
-        forecast = (f"🤖 Прогноз нейросети: продержится ≥{dataApp.FUNDING_FORECAST_HOURS}ч "
-                    f"с вероятностью <b>{opp['proba'] * 100:.0f}%</b>")
+        forecast = (f"🤖 Прогноз нейросети: доход ≥{dataApp.FUNDING_MIN_DELTA}% {per} продержится "
+                    f"> {days:.0f} дн. с вероятностью <b>{opp['proba'] * 100:.0f}%</b>")
     else:
-        forecast = f"🤖 Прогноз: {opp['method']} — держится ≥{dataApp.FUNDING_FALLBACK_HOURS}ч"
+        forecast = (f"🤖 Прогноз: {opp['method']} — уже держится "
+                    f"≥ {_hours_text(dataApp.FUNDING_FALLBACK_HOURS)}")
+
+    past = opp.get("past") or {}
+    if past.get("count"):
+        past_line = (f"📜 Раньше по монете: {past['count']} период(ов) с доходом ≥{dataApp.FUNDING_MIN_DELTA}% {per}, "
+                     f"в среднем {_hours_text(past['avg'])}, максимум {_hours_text(past['max'])}, "
+                     f"дольше {days:.0f} дн. — {past['long']}\n")
+    else:
+        past_line = (f"📜 Завершённых периодов с доходом ≥{dataApp.FUNDING_MIN_DELTA}% {per} "
+                     f"за {_hours_text(past.get('hours', 0))} истории не было\n")
+
+    loss = max(opp["price_diff"], 0)
+    payback = f", отобьётся фандингом за ~{_hours_text(loss / opp['delta'] * 24)}" if loss > 0 else ""
+    expected = opp["delta"] * days - loss
 
     return (
-        f"💸 <b>Фандинг: Bybit LONG / MEXC SHORT</b>\n"
+        f"💸 <b>Снайпер: Bybit LONG / MEXC SHORT</b>\n"
         f"Монета: <b>{opp['symbol']}</b>\n"
         f"🟢 Лонг Bybit: <a href='{opp['bybit_link']}'>${_fmt_price(opp['bybit_price'])}</a> — фандинг "
         f"{rate_line(opp['bybit_rate'], opp['bybit_interval'], opp['bybit_norm'])}{_until(opp['bybit_next'])}\n"
         f"🔴 Шорт MEXC: <a href='{opp['mexc_link']}'>${_fmt_price(opp['mexc_price'])}</a> — фандинг "
         f"{rate_line(opp['mexc_rate'], opp['mexc_interval'], opp['mexc_norm'])}{_until(opp['mexc_next'])}\n"
-        f"📊 Дельта фандинга: <b>{opp['delta']:.3f}%</b>{per}\n"
-        f"📉 Разница цен: {opp['price_diff']:.3f}% ≤ {opp['delta']:.3f}% ✅\n"
-        f"⏳ По истории держится: {opp['history_hours']} ч\n"
+        f"📊 Доход по фандингу: <b>{opp['delta']:.3f}% {per}</b>\n"
+        f"📉 Вход по цене: {-opp['price_diff']:+.3f}% (допустимо до -{dataApp.FUNDING_MAX_ENTRY_LOSS}%){payback}\n"
+        f"💰 Если продержится {days:.0f} дн.: ≈ {expected:+.2f}% с учётом входа\n"
+        f"⏳ Уже держится: {_hours_text(opp['history_hours'])}\n"
+        f"{past_line}"
         f"{forecast}"
     )
 
