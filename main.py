@@ -67,16 +67,36 @@ black_list_symbols = set()
 # Но так как они уже объявлены в вашем файле, просто вставьте эту функцию
 # где-нибудь вверху, например, сразу после импортов.
 
+_send_errors = {}   # chat_id -> время последнего вывода ошибки (чтобы не засорять лог)
+
+
+def _channel_name(chat_id):
+    """Название канала по ID — для понятных сообщений в логе."""
+    for name, value in globals().items():
+        if name.startswith(("CHANNEL_ID", "LISTING")) and str(value) == str(chat_id):
+            return f"{name} ({chat_id})"
+    return str(chat_id)
+
+
 async def tg_send(chat_id, text, **kwargs):
-    """Отправка в Telegram с ожиданием при флуд-контроле.
-    Без этого одна ошибка 'Flood control exceeded' обрывала отправку всей пачки сделок."""
+    """Отправка в Telegram.
+    - при флуд-контроле ждёт и повторяет;
+    - при любой другой ошибке пишет в лог, в какой канал не ушло и почему,
+      и НЕ обрывает отправку в остальные каналы."""
     for attempt in range(3):
         try:
             return await bot.send_message(chat_id, text, **kwargs)
         except TelegramRetryAfter as e:
-            print(f"Telegram флуд-контроль в {chat_id}: жду {e.retry_after} сек")
+            print(f"Telegram флуд-контроль в {_channel_name(chat_id)}: жду {e.retry_after} сек")
             await asyncio.sleep(e.retry_after + 1)
-    print(f"Сообщение в {chat_id} не отправлено после 3 попыток")
+        except Exception as e:
+            now = time.time()
+            if now - _send_errors.get(chat_id, 0) > 600:
+                print(f"❗ Не удалось отправить в канал {_channel_name(chat_id)}: {e}")
+                _send_errors[chat_id] = now
+            return None
+    print(f"Сообщение в {_channel_name(chat_id)} не отправлено после 3 попыток (флуд-контроль)")
+    return None
 
 
 def format_opportunity_message(opp):
